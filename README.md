@@ -8,11 +8,13 @@ you're on. Only the small "pointer" files that *build* the sidebar live in a fol
 after your account. This tool points the new account's folder at the old one, so both
 share a single list.
 
-> Windows port of **[gileneusz/claude-code-switch](https://github.com/gileneusz/claude-code-switch)**
-> by Mateusz Gilewicz (macOS, MIT). The idea and the original implementation are theirs;
-> this is a rewrite in PowerShell with Windows-native mechanics. Credit for the underlying
-> trick goes to [@rchybicki](https://x.com/rchybicki), spotted in a thread by
-> [@theo](https://x.com/theo).
+> ### Based on [gileneusz/claude-code-switch](https://github.com/gileneusz/claude-code-switch)
+>
+> That project worked out how the desktop app stores its sessions and solved this on macOS
+> with a bash script. The idea, the research, and the original implementation are theirs.
+>
+> **This repository is a PowerShell rewrite for Windows** — the same approach, rebuilt on
+> Windows mechanics. Not a translation of the script; nothing of the original runs here.
 
 > **Unofficial.** Not affiliated with or endorsed by Anthropic. Use it with your own
 > account(s) and within Anthropic's Terms of Service.
@@ -115,10 +117,9 @@ junction can't simply be dropped on top of it:
 
 - **`replace`** — stash that folder in the backup, delete it, create the junction. One
   shared list. The stashed sessions leave the sidebar until you copy them back; the script
-  prints the exact command. *This is a Windows-only extension — the macOS original only
-  offers merge/skip here.*
+  prints the exact command. *Added by this rewrite; the original offers only merge/skip here.*
 - **`merge`** — copy the old account's pointers into the new folder. Nothing is deleted and
-  nothing links, so each account keeps its own list from then on. *This is what macOS does.*
+  nothing links, so each account keeps its own list from then on. *This is the original behaviour.*
 - **`skip`** — change nothing.
 
 Want a single shared list containing everything? Use `replace`, then run the `Copy-Item`
@@ -215,9 +216,12 @@ entire session index, so the script doesn't delegate that behaviour to the platf
 
 ---
 
-## Differences from the macOS original
+## What the rewrite changed
 
-| | macOS | this port |
+The macOS script and this one share an approach, not a line of code. Windows needed
+different mechanics throughout:
+
+| | macOS original | this rewrite |
 |---|---|---|
 | Link type | symlink | directory junction (no elevation needed) |
 | App detection | `lsappinfo`, `pgrep` | `Get-Process` |
@@ -254,5 +258,4 @@ failures here.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Original copyright Mateusz Gilewicz; Windows port copyright
-Ahmed Rashad.
+MIT, carried over from the original project — see [LICENSE](LICENSE).
