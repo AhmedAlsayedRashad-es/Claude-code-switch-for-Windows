@@ -238,6 +238,36 @@ function New-Junction {
     if (-not (Test-IsReparse $LinkPath)) { throw "junction was not created: $LinkPath" }
 }
 
+function Test-JunctionCreatable {
+    <#  Create and immediately remove a throwaway junction next to where the real one will
+        go, so that a permissions or filesystem failure surfaces while everything is still
+        intact rather than after the target directory has been deleted. #>
+    param(
+        [Parameter(Mandatory)][string]$ParentDir,
+        [Parameter(Mandatory)][string]$TargetPath
+    )
+    if ($DryRun) { return }
+
+    $probe = Join-Path $ParentDir ('.ccswitch-probe-' + [IO.Path]::GetRandomFileName())
+    try {
+        if (-not (Test-Path -LiteralPath $ParentDir)) {
+            New-Item -ItemType Directory -Path $ParentDir -Force | Out-Null
+        }
+        New-Item -ItemType Junction -Path $probe -Value $TargetPath -ErrorAction Stop | Out-Null
+        if (-not (Test-IsReparse $probe)) { throw 'the probe junction did not materialise' }
+    }
+    catch {
+        throw ("cannot create a junction in ${ParentDir}: $($_.Exception.Message)`n" +
+            '       Nothing was deleted. If the session store lives inside a Microsoft Store package, ' +
+            'try running this from a shell with write access to that folder.')
+    }
+    finally {
+        if (Test-Path -LiteralPath $probe) {
+            try { [IO.Directory]::Delete($probe, $false) } catch { Write-Warn "could not remove the probe link: $probe" }
+        }
+    }
+}
+
 function Remove-Link {
     <# Unlink a junction WITHOUT touching whatever it points at. #>
     param([Parameter(Mandatory)][string]$LinkPath)
@@ -703,6 +733,12 @@ function Invoke-LinkOrg {
             }
             # 'replace' falls through to the stash-and-link path below
         }
+
+        # Pre-flight: prove a junction can actually be created here BEFORE deleting
+        # anything. Otherwise a permission failure (these folders live inside an MSIX
+        # package's private LocalCache) would leave the directory deleted with no link in
+        # its place - recoverable from the backup, but a window worth not having.
+        Test-JunctionCreatable (Split-Path $newPath -Parent) $master
 
         # stash the folder into the backup, then remove it so a junction can take its place
         if (-not $script:Backup) { throw 'internal: no backup directory - refusing to delete anything' }
