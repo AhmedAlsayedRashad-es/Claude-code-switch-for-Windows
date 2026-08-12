@@ -86,7 +86,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$VERSION = '1.0.0-windows'
+$VERSION = '1.0.1-windows'
 
 # ---- configuration (env-overridable, same names as the macOS original) ------------------
 function Get-Env([string]$name, [string]$fallback) {
@@ -368,12 +368,70 @@ function Wait-AppClosed {
 }
 
 # ---- discovery -------------------------------------------------------------------------
+function Get-SubDirectories {
+    <#  Directory listing via .NET rather than Get-ChildItem.
+
+        Get-ChildItem is a command name, and a command name can be shadowed by a profile
+        function, an alias or a proxy. When that happens a swallowed error looks exactly
+        like "there are no sessions here", which is the worst possible way for this script
+        to fail. [IO.Directory] cannot be intercepted. #>
+    param([Parameter(Mandatory)][string]$LiteralPath)
+    if (-not [IO.Directory]::Exists($LiteralPath)) { return @() }
+    return @([IO.Directory]::GetDirectories($LiteralPath))
+}
+
 function Get-AccountDirs {
     param([Parameter(Mandatory)][string]$Base)
     $root = Join-Path $SupportDir $Base
-    if (-not (Test-Path -LiteralPath $root)) { return @() }
-    return @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match $UUID_RE })
+    $out = @()
+    foreach ($d in (Get-SubDirectories $root)) {
+        $name = [IO.Path]::GetFileName($d)
+        if ($name -notmatch $UUID_RE) { continue }
+        $out += [pscustomobject]@{
+            Name             = $name
+            FullName         = $d
+            LastWriteTimeUtc = [IO.Directory]::GetLastWriteTimeUtc($d)
+        }
+    }
+    return $out
+}
+
+function Get-OrgDirs {
+    param([Parameter(Mandatory)][string]$AccountPath)
+    $out = @()
+    foreach ($d in (Get-SubDirectories $AccountPath)) {
+        $name = [IO.Path]::GetFileName($d)
+        if ($name -notmatch $UUID_RE) { continue }
+        $out += [pscustomobject]@{ Name = $name; FullName = $d }
+    }
+    return $out
+}
+
+function Write-DiscoveryDump {
+    <# Printed whenever discovery comes up empty, so the failure explains itself. #>
+    Write-Plain ''
+    Write-Warn 'Discovery found nothing. This is what the script actually sees:'
+    Write-Plain "    support dir      : $SupportDir"
+    Write-Plain "    exists           : $([IO.Directory]::Exists($SupportDir))"
+    foreach ($base in $BASES) {
+        $root = Join-Path $SupportDir $base
+        Write-Plain "    $base"
+        Write-Plain "      path           : $root"
+        Write-Plain "      exists         : $([IO.Directory]::Exists($root))"
+        $subs = Get-SubDirectories $root
+        Write-Plain "      subdirectories : $($subs.Count)"
+        foreach ($s in $subs) {
+            $n = [IO.Path]::GetFileName($s)
+            $ok = 'UUID'
+            if ($n -notmatch $UUID_RE) { $ok = 'ignored (not a UUID)' }
+            Write-Plain "        - $n  [$ok]"
+        }
+    }
+    Write-Plain ''
+    Write-Plain '    If the folders are listed above but the script still says none were found,'
+    Write-Plain '    please report this output. If CCSWITCH_SUPPORT_DIR is set in your shell it'
+    Write-Plain '    overrides the default location:'
+    Write-Plain "      CCSWITCH_SUPPORT_DIR = $([Environment]::GetEnvironmentVariable('CCSWITCH_SUPPORT_DIR'))"
 }
 
 function Find-Master {
@@ -386,8 +444,7 @@ function Find-Master {
 
     foreach ($acc in (Get-AccountDirs 'claude-code-sessions')) {
         if ($OldAccount -and $acc.Name -ne $OldAccount) { continue }
-        foreach ($org in @(Get-ChildItem -LiteralPath $acc.FullName -Directory -Force -ErrorAction SilentlyContinue)) {
-            if ($org.Name -notmatch $UUID_RE) { continue }
+        foreach ($org in (Get-OrgDirs $acc.FullName)) {
             if (Test-IsReparse $org.FullName) { continue }   # links are never the master
             $n = Get-PointerCount $org.FullName
             if ($n -gt $best) {
@@ -405,8 +462,7 @@ function Get-LinkedCount {
     $master = Resolve-PhysicalDir (Join-Path $SupportDir "claude-code-sessions\$($script:OldAcc)\$($script:OldOrg)")
     $n = 0
     foreach ($acc in (Get-AccountDirs 'claude-code-sessions')) {
-        foreach ($org in @(Get-ChildItem -LiteralPath $acc.FullName -Force -ErrorAction SilentlyContinue)) {
-            if ($org.Name -notmatch $UUID_RE) { continue }
+        foreach ($org in (Get-OrgDirs $acc.FullName)) {
             if (-not (Test-IsReparse $org.FullName)) { continue }
             if ((Resolve-PhysicalDir $org.FullName) -eq $master) { $n++ }
         }
@@ -440,10 +496,8 @@ function Find-NewAccount {
     $orgs = @()
     foreach ($base in $BASES) {
         $dir = Join-Path $SupportDir "$base\$($script:NewAcc)"
-        if (-not (Test-Path -LiteralPath $dir)) { continue }
-        # -Force and no -Directory: broken junctions must show up too, they are repairable
-        foreach ($org in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) {
-            if ($org.Name -notmatch $UUID_RE) { continue }
+        # broken junctions are still directory entries here, and they are repairable
+        foreach ($org in (Get-OrgDirs $dir)) {
             if ($orgs -notcontains $org.Name) { $orgs += $org.Name }
         }
     }
@@ -679,8 +733,7 @@ function Invoke-Status {
         $accounts = Get-AccountDirs $base
         if ($accounts.Count -eq 0) { Write-Plain '    (none)'; continue }
         foreach ($acc in $accounts) {
-            foreach ($org in @(Get-ChildItem -LiteralPath $acc.FullName -Force -ErrorAction SilentlyContinue)) {
-                if ($org.Name -notmatch $UUID_RE) { continue }
+            foreach ($org in (Get-OrgDirs $acc.FullName)) {
                 $kind = 'dir     '
                 $extra = ''
                 if (Test-IsReparse $org.FullName) {
@@ -699,12 +752,14 @@ function Invoke-Status {
     }
     else {
         Write-Warn "No desktop sessions found in: $SupportDir\claude-code-sessions"
+        Write-DiscoveryDump
     }
     Write-Plain "retention (cleanupPeriodDays): $(Get-RetentionCurrent)"
 }
 
 function Invoke-Transfer {
     if (-not (Find-Master)) {
+        Write-DiscoveryDump
         throw "No desktop sessions found in: $SupportDir\claude-code-sessions"
     }
 
@@ -903,6 +958,7 @@ try {
             }
             else {
                 Write-Warn "No desktop sessions found in: $SupportDir\claude-code-sessions"
+                Write-DiscoveryDump
             }
             Show-Menu
         }
