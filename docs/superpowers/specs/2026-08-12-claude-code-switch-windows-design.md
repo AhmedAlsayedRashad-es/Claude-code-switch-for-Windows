@@ -13,8 +13,10 @@ Observed on this machine (2026-08-12):
 
 | Account | Org | Pointers | Range |
 |---|---|---|---|
-| `a91f3470-d09b-46e3-b495-6740149d38d1` | `62e332bf-3ee4-454c-9155-1b2f0059b698` | 34 | 6 Jul → 12 Aug 16:52 |
-| `4fbee629-690c-4ee0-b1c5-d1eb6561197c` | `1381aefe-c861-419b-a5c5-908cc369ca21` | 2 | 12 Aug 17:25, 17:30 |
+| `<OLD_ACCOUNT_UUID>` | `<OLD_ORG_UUID>` | 34 | 6 Jul → 12 Aug 16:52 |
+| `<NEW_ACCOUNT_UUID>` | `<NEW_ORG_UUID>` | 2 | 12 Aug 17:25, 17:30 |
+
+(Account and organization UUIDs are account identifiers and are redacted here.)
 
 All 34 orphaned pointers resolve to transcripts that exist on disk (verified: found=34,
 missing=0). Nothing is lost; the index is merely orphaned.
