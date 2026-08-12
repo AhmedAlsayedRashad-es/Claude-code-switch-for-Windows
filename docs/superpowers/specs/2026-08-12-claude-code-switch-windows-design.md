@@ -119,11 +119,10 @@ the `N>0` case is a Windows-only extension introduced here. It remains safe (sta
 verified backup + printed restore command), but the parity justification was false and the
 user's choice was made partly on it.
 
-Consequence,
-accepted explicitly: the sidebar entries *"Claude code-switch for Windows"* and
-*"Restore deleted chats after subscription change"* disappear. Their pointer files are
-preserved at `<backup>\replaced-dirs\...` and the script prints the copy command to
-restore them.
+**Final decision (2026-08-12, after the correction above):** keep `replace`, then copy the
+two stashed pointers into the shared master folder. End state is a single shared list of
+36 sessions visible from both accounts, with nothing left behind in the backup only. The
+script prints the exact copy command at the end of a transfer.
 
 `rollback` moves the live index trees aside (rename, not delete), copies the backup in,
 and only then removes the moved-aside copies — via `Remove-TreeSafely`, because they may
