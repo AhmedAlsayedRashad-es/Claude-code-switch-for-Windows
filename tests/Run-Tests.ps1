@@ -1,0 +1,388 @@
+<#
+.SYNOPSIS
+    Test suite for claude-code-switch.ps1.
+
+.DESCRIPTION
+    Every test builds a synthetic sandbox and points the script at it with
+    CCSWITCH_SUPPORT_DIR / CCSWITCH_CLAUDE_DIR / CCSWITCH_BACKUP_ROOT. The real
+    %APPDATA%\Claude is never read or written by this suite.
+
+    The script under test is run in a child powershell.exe, the same way a user runs it,
+    so `exit` codes and the top-level error handler are exercised for real.
+#>
+[CmdletBinding()]
+param([string]$Only)
+
+$ErrorActionPreference = 'Stop'
+
+$ScriptPath  = Join-Path (Split-Path $PSScriptRoot -Parent) 'claude-code-switch.ps1'
+$SandboxRoot = Join-Path $PSScriptRoot 'sandbox'
+
+$OLD_ACC = '11111111-1111-1111-1111-111111111111'
+$OLD_ORG = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+$NEW_ACC = '22222222-2222-2222-2222-222222222222'
+$NEW_ORG = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+$BASES   = @('claude-code-sessions', 'local-agent-mode-sessions')
+
+$script:Pass = 0
+$script:Fail = 0
+$script:Failures = @()
+$script:CurrentTest = ''
+
+# ---- harness ---------------------------------------------------------------------------
+function Remove-TestTree {
+    # the sandbox contains junctions; a naive -Recurse delete would follow them
+    param([string]$LiteralPath)
+    if (-not (Test-Path -LiteralPath $LiteralPath)) { return }
+    $item = Get-Item -LiteralPath $LiteralPath -Force
+    if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        if ($item.PSIsContainer) { [IO.Directory]::Delete($LiteralPath, $false) }
+        else { [IO.File]::Delete($LiteralPath) }
+        return
+    }
+    if (-not $item.PSIsContainer) { [IO.File]::Delete($LiteralPath); return }
+    foreach ($e in [IO.Directory]::GetFileSystemEntries($LiteralPath)) { Remove-TestTree $e }
+    [IO.Directory]::Delete($LiteralPath, $false)
+}
+
+function Assert-That {
+    param([bool]$Condition, [string]$Message)
+    if ($Condition) {
+        $script:Pass++
+        Write-Host "    ok   $Message" -ForegroundColor DarkGreen
+    }
+    else {
+        $script:Fail++
+        $script:Failures += "$($script:CurrentTest): $Message"
+        Write-Host "    FAIL $Message" -ForegroundColor Red
+    }
+}
+
+function Assert-Equal {
+    param($Expected, $Actual, [string]$Message)
+    Assert-That ($Expected -eq $Actual) "$Message (expected '$Expected', got '$Actual')"
+}
+
+function Test-Case {
+    param([string]$Name, [scriptblock]$Body)
+    if ($Only -and $Name -notlike "*$Only*") { return }
+    $script:CurrentTest = $Name
+    Write-Host ''
+    Write-Host "  $Name" -ForegroundColor Cyan
+    try { & $Body }
+    catch {
+        $script:Fail++
+        $script:Failures += "${Name}: threw - $($_.Exception.Message)"
+        Write-Host "    FAIL threw: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+function New-Pointer {
+    param([string]$Dir, [string]$Title)
+    $id = [guid]::NewGuid().ToString()
+    $obj = [ordered]@{
+        sessionId    = "local_$id"
+        cliSessionId = [guid]::NewGuid().ToString()
+        cwd          = 'D:\fixture'
+        title        = $Title
+        model        = 'claude-opus-5'
+        lastActivityAt = 1786544725442
+    }
+    ($obj | ConvertTo-Json) | Set-Content -LiteralPath (Join-Path $Dir "local_$id.json") -Encoding UTF8
+}
+
+function New-Sandbox {
+    <# Returns a hashtable of paths. oldCount pointers under OLD, newCount under NEW. #>
+    param([string]$Name, [int]$OldCount = 5, [int]$NewCount = 0, [switch]$NoNewOrg)
+
+    $root = Join-Path $SandboxRoot $Name
+    Remove-TestTree $root
+    $support = Join-Path $root 'support'
+    $claude  = Join-Path $root 'claude'
+    $backups = Join-Path $root 'backups'
+
+    foreach ($base in $BASES) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $support "$base\$OLD_ACC\$OLD_ORG") | Out-Null
+        if (-not $NoNewOrg) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $support "$base\$NEW_ACC\$NEW_ORG") | Out-Null
+        }
+    }
+    # a non-UUID directory the real app creates; the script must ignore it
+    New-Item -ItemType Directory -Force -Path (Join-Path $support "local-agent-mode-sessions\skills-plugin\$OLD_ORG") | Out-Null
+
+    $oldDir = Join-Path $support "claude-code-sessions\$OLD_ACC\$OLD_ORG"
+    $newDir = Join-Path $support "claude-code-sessions\$NEW_ACC\$NEW_ORG"
+    for ($i = 1; $i -le $OldCount; $i++) { New-Pointer -Dir $oldDir -Title "old session $i" }
+    for ($i = 1; $i -le $NewCount; $i++) { New-Pointer -Dir $newDir -Title "new session $i" }
+
+    New-Item -ItemType Directory -Force -Path (Join-Path $claude 'projects\proj') | Out-Null
+    '{"type":"user"}' | Set-Content -LiteralPath (Join-Path $claude 'projects\proj\fixture.jsonl') -Encoding UTF8
+    '{"model":"opus","permissions":{"allow":["Bash"]}}' | Set-Content -LiteralPath (Join-Path $claude 'settings.json') -Encoding UTF8
+    '{"oauthAccount":{"emailAddress":"fixture@example.com"}}' | Set-Content -LiteralPath (Join-Path $root 'claude.json') -Encoding UTF8
+    New-Item -ItemType Directory -Force -Path $backups | Out-Null
+
+    # the new account must look fresher than the old one for auto-detection
+    foreach ($base in $BASES) {
+        $p = Join-Path $support "$base\$OLD_ACC"
+        if (Test-Path $p) { (Get-Item $p).LastWriteTimeUtc = (Get-Date).AddDays(-3).ToUniversalTime() }
+        $p = Join-Path $support "$base\$NEW_ACC"
+        if (Test-Path $p) { (Get-Item $p).LastWriteTimeUtc = (Get-Date).ToUniversalTime() }
+    }
+
+    return @{
+        Root = $root; Support = $support; Claude = $claude; Backups = $backups
+        OldDir = $oldDir; NewDir = $newDir
+        ClaudeJson = (Join-Path $root 'claude.json')
+    }
+}
+
+function Invoke-Ccs {
+    param([hashtable]$Sandbox, [string[]]$CcsArgs)
+    $env:CCSWITCH_SUPPORT_DIR = $Sandbox.Support
+    $env:CCSWITCH_CLAUDE_DIR  = $Sandbox.Claude
+    $env:CCSWITCH_CLAUDE_JSON = $Sandbox.ClaudeJson
+    $env:CCSWITCH_BACKUP_ROOT = $Sandbox.Backups
+    $env:CCSWITCH_TEST_MODE   = '1'
+    try {
+        $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath @CcsArgs 2>&1
+        $code = $LASTEXITCODE
+        return @{ Output = ($out | Out-String); Code = $code }
+    }
+    finally {
+        Remove-Item env:CCSWITCH_SUPPORT_DIR, env:CCSWITCH_CLAUDE_DIR, env:CCSWITCH_CLAUDE_JSON,
+        env:CCSWITCH_BACKUP_ROOT, env:CCSWITCH_TEST_MODE -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-Pointers { param([string]$Dir)
+    if (-not (Test-Path -LiteralPath $Dir)) { return 0 }
+    return @(Get-ChildItem -LiteralPath $Dir -Filter 'local_*.json' -File -Force -EA SilentlyContinue).Count
+}
+function Test-Junction { param([string]$P)
+    if (-not (Test-Path -LiteralPath $P)) { return $false }
+    return [bool]((Get-Item -LiteralPath $P -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)
+}
+function Get-Backup { param([hashtable]$S)
+    return @(Get-ChildItem -LiteralPath $S.Backups -Directory -Filter 'claude-backup-*' -EA SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -First 1)[0]
+}
+
+# ---- tests -----------------------------------------------------------------------------
+Remove-TestTree $SandboxRoot
+New-Item -ItemType Directory -Force -Path $SandboxRoot | Out-Null
+Write-Host "Testing $ScriptPath" -ForegroundColor Cyan
+Write-Host "Sandbox  $SandboxRoot" -ForegroundColor DarkGray
+
+Test-Case 'T1 status reports the master and its pointer count' {
+    $s = New-Sandbox 't1' -OldCount 7 -NewCount 2
+    $r = Invoke-Ccs $s @('-Command', 'status')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That ($r.Output -match "master: $OLD_ACC / $OLD_ORG - 7 session") 'reports 7 sessions on the master'
+    Assert-That ($r.Output -match 'skills-plugin' -eq $false) 'ignores the non-UUID skills-plugin directory'
+    Assert-Equal 7 (Get-Pointers $s.OldDir) 'master untouched by a status read'
+}
+
+Test-Case 'T2 transfer into a sessionless org creates a junction' {
+    $s = New-Sandbox 't2' -OldCount 5 -NewCount 0
+    $r = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That (Test-Junction $s.NewDir) 'new account org is now a junction'
+    Assert-Equal 5 (Get-Pointers $s.OldDir) 'master still has all 5 pointers'
+    Assert-Equal 5 (Get-Pointers $s.NewDir) 'the junction reads through to 5 pointers'
+    Assert-That (Test-Junction (Join-Path $s.Support "local-agent-mode-sessions\$NEW_ACC\$NEW_ORG")) 'agent-mode base linked too'
+}
+
+Test-Case 'T3 -OnConflict replace stashes existing pointers, then links' {
+    $s = New-Sandbox 't3' -OldCount 5 -NewCount 2
+    $r = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That (Test-Junction $s.NewDir) 'new account org is now a junction'
+    Assert-Equal 5 (Get-Pointers $s.OldDir) 'master still has all 5 pointers'
+    $b = Get-Backup $s
+    $stash = Join-Path $b.FullName "replaced-dirs\claude-code-sessions-$NEW_ACC\$NEW_ORG"
+    Assert-Equal 2 (Get-Pointers $stash) 'both displaced pointers are stashed in the backup'
+    Assert-That ($r.Output -match 'stashed 2 pointer file') 'reports the stash'
+    Assert-That ($r.Output -match 'new session 1') 'names the sessions leaving the sidebar'
+}
+
+Test-Case 'T4 -OnConflict merge copies pointers in and deletes nothing' {
+    $s = New-Sandbox 't4' -OldCount 5 -NewCount 2
+    $r = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'merge')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That (-not (Test-Junction $s.NewDir)) 'no junction was created'
+    Assert-Equal 5 (Get-Pointers $s.OldDir) 'master untouched'
+    Assert-Equal 7 (Get-Pointers $s.NewDir) 'new account now holds 2 own + 5 merged'
+}
+
+Test-Case 'T5 -OnConflict skip changes nothing' {
+    $s = New-Sandbox 't5' -OldCount 5 -NewCount 2
+    $r = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'skip')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That (-not (Test-Junction $s.NewDir)) 'no junction'
+    Assert-Equal 5 (Get-Pointers $s.OldDir) 'master untouched'
+    Assert-Equal 2 (Get-Pointers $s.NewDir) 'new account untouched'
+}
+
+Test-Case 'T6 a second run is idempotent' {
+    $s = New-Sandbox 't6' -OldCount 5 -NewCount 0
+    $null = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace')
+    $r = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That ($r.Output -match 'already shared') 'reports already shared'
+    Assert-Equal 5 (Get-Pointers $s.OldDir) 'master still has all 5 pointers'
+    Assert-That (Test-Junction $s.NewDir) 'junction still in place'
+}
+
+Test-Case 'T7 a broken junction is re-pointed' {
+    $s = New-Sandbox 't7' -OldCount 4 -NewCount 0
+    Remove-TestTree $s.NewDir
+    $bogus = Join-Path $s.Root 'gone'
+    New-Item -ItemType Directory -Force -Path $bogus | Out-Null
+    New-Item -ItemType Junction -Path $s.NewDir -Value $bogus | Out-Null
+    Remove-TestTree $bogus     # now the junction dangles
+    $r = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That ($r.Output -match 'fixed an existing link') 'reports the repair'
+    Assert-Equal 4 (Get-Pointers $s.NewDir) 'junction now reads the master'
+    Assert-Equal 4 (Get-Pointers $s.OldDir) 'master intact'
+}
+
+Test-Case 'T8 CHARACTERIZATION: how this platform deletes a junction' {
+    # Not a test of our code. It pins down what the platform actually does, so the claim
+    # in the docs stays honest if someone runs this on a different build. If any line here
+    # reports DESTROYED, Remove-TreeSafely is load-bearing on that machine rather than
+    # defence in depth.
+    function New-HazCase([string]$n) {
+        $r = Join-Path $SandboxRoot "t8\$n"
+        $m = Join-Path $r 'master'; $p = Join-Path $r 'parent'
+        New-Item -ItemType Directory -Force -Path $m, $p | Out-Null
+        1..3 | ForEach-Object { "data $_" | Set-Content -LiteralPath (Join-Path $m "f$_.txt") }
+        New-Item -ItemType Junction -Path (Join-Path $p 'link') -Value $m | Out-Null
+        return @{ Master = $m; Parent = $p; Link = (Join-Path $p 'link') }
+    }
+    function Assert-TargetSurvived([hashtable]$c, [string]$what) {
+        $n = @(Get-ChildItem -LiteralPath $c.Master -File -EA SilentlyContinue).Count
+        Assert-That ($n -eq 3) "$what left the junction target intact ($n of 3 files)"
+    }
+
+    Write-Host "    platform: PowerShell $($PSVersionTable.PSVersion) on $([Environment]::OSVersion.Version)" -ForegroundColor DarkGray
+
+    $a = New-HazCase 'a'
+    try { Remove-Item -LiteralPath $a.Parent -Recurse -Force -EA Stop } catch {}
+    Assert-TargetSurvived $a 'Remove-Item -Recurse on the parent'
+
+    $b = New-HazCase 'b'
+    try { Remove-Item -LiteralPath $b.Link -Recurse -Force -EA Stop } catch {}
+    Assert-TargetSurvived $b 'Remove-Item -Recurse on the link itself'
+
+    $c = New-HazCase 'c'
+    try { & cmd.exe /c rmdir /s /q $c.Parent 2>&1 | Out-Null } catch {}
+    Assert-TargetSurvived $c 'cmd rmdir /s /q'
+
+    $d = New-HazCase 'd'
+    $seen = @(Get-ChildItem -LiteralPath $d.Parent -Recurse -File -Force -EA SilentlyContinue).Count
+    Assert-That ($seen -eq 0) "Get-ChildItem -Recurse does not enumerate through the junction (saw $seen)"
+
+    # and the property we actually depend on: our own walker unlinks without following
+    $e = New-HazCase 'e'
+    Remove-TestTree $e.Parent
+    Assert-TargetSurvived $e 'our junction-aware walker'
+    Assert-That (-not (Test-Path -LiteralPath $e.Parent)) 'our walker still removed the parent'
+}
+
+Test-Case 'T9 rollback restores the pre-state without harming the master' {
+    $s = New-Sandbox 't9' -OldCount 6 -NewCount 2
+    $r1 = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace')
+    Assert-Equal 0 $r1.Code 'transfer succeeded'
+    Assert-That (Test-Junction $s.NewDir) 'junction created'
+
+    # the live tree now contains a junction; rollback moves it aside and deletes it.
+    # This is the hazard case from T8, exercised end to end.
+    $b = Get-Backup $s
+    $r2 = Invoke-Ccs $s @('-Command', 'rollback', $b.FullName)
+    Assert-Equal 0 $r2.Code 'rollback exit code is 0'
+    Assert-Equal 6 (Get-Pointers $s.OldDir) 'MASTER SURVIVED the rollback delete'
+    Assert-That (-not (Test-Junction $s.NewDir)) 'junction is gone'
+    Assert-Equal 2 (Get-Pointers $s.NewDir) 'the new account got its 2 original pointers back'
+    Assert-That (-not (Test-Path (Join-Path $s.Support '.claude-code-sessions.pre-rollback.*'))) 'no leftover scratch dir'
+}
+
+Test-Case 'T10 backup does not traverse junctions' {
+    $s = New-Sandbox 't10' -OldCount 3 -NewCount 0
+    # a junction inside .claude, like the real ~\.claude\agents
+    $outside = Join-Path $s.Root 'outside'
+    New-Item -ItemType Directory -Force -Path $outside | Out-Null
+    1..4 | ForEach-Object { "x" | Set-Content -LiteralPath (Join-Path $outside "big$_.txt") }
+    New-Item -ItemType Junction -Path (Join-Path $s.Claude 'agents') -Value $outside | Out-Null
+
+    $r = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    $b = Get-Backup $s
+    $copied = Join-Path $b.FullName 'dot-claude\agents'
+    Assert-That (-not (Test-Path (Join-Path $copied 'big1.txt'))) 'junction contents were NOT copied into the backup'
+    $manifest = Get-Content -LiteralPath (Join-Path $b.FullName 'manifest.json') -Raw | ConvertFrom-Json
+    Assert-That (@($manifest.reparsePoints).Count -ge 1) 'the junction is recorded in the manifest instead'
+    Assert-Equal 4 (@(Get-ChildItem -LiteralPath $outside -File).Count) 'the junction target is untouched'
+}
+
+Test-Case 'T11 a failing backup aborts before anything is mutated' {
+    $s = New-Sandbox 't11' -OldCount 5 -NewCount 2
+    $s2 = $s.Clone()
+    $s2.Backups = 'Q:\no-such-drive\backups'      # backup creation must fail here
+    $r = Invoke-Ccs $s2 @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace')
+    Assert-Equal 1 $r.Code 'exits non-zero'
+    Assert-That (-not (Test-Junction $s.NewDir)) 'no junction was created'
+    Assert-Equal 5 (Get-Pointers $s.OldDir) 'master untouched'
+    Assert-Equal 2 (Get-Pointers $s.NewDir) 'new account untouched'
+    Assert-That ($r.Output -match 'Nothing was changed') 'says nothing was changed'
+}
+
+Test-Case 'T12 -DryRun mutates nothing' {
+    $s = New-Sandbox 't12' -OldCount 5 -NewCount 2
+    $r = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace', '-DryRun')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That ($r.Output -match 'DRY RUN COMPLETE') 'reports a dry run'
+    Assert-That (-not (Test-Junction $s.NewDir)) 'no junction created'
+    Assert-Equal 5 (Get-Pointers $s.OldDir) 'master untouched'
+    Assert-Equal 2 (Get-Pointers $s.NewDir) 'new account untouched'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $s.Backups -Directory -EA SilentlyContinue).Count) 'no backup directory created'
+}
+
+Test-Case 'T13 retention write preserves unrelated settings keys' {
+    $s = New-Sandbox 't13' -OldCount 2 -NewCount 0
+    $r = Invoke-Ccs $s @('-Command', 'retention', '-RetentionDays', '3650')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    $j = Get-Content -LiteralPath (Join-Path $s.Claude 'settings.json') -Raw | ConvertFrom-Json
+    Assert-Equal 3650 $j.cleanupPeriodDays 'cleanupPeriodDays was set'
+    Assert-Equal 'opus' $j.model 'unrelated key "model" preserved'
+    Assert-Equal 'Bash' $j.permissions.allow[0] 'nested permissions preserved'
+    Assert-That (Test-Path (Join-Path $s.Claude 'settings.json.bak')) 'a .bak was written'
+}
+
+Test-Case 'T14 the new account is auto-detected when not given' {
+    $s = New-Sandbox 't14' -OldCount 5 -NewCount 0
+    $r = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-OnConflict', 'replace')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That ($r.Output -match "Detected new account: $NEW_ACC") 'auto-detected the fresher account'
+    Assert-That (Test-Junction $s.NewDir) 'junction created'
+    Assert-Equal 5 (Get-Pointers $s.OldDir) 'master intact'
+}
+
+Test-Case 'T15 refuses to touch paths outside the session store' {
+    $s = New-Sandbox 't15' -OldCount 3 -NewCount 0
+    $r = Invoke-Ccs $s @('-Command', 'rollback', (Join-Path $s.Root 'no-such-backup'))
+    Assert-Equal 1 $r.Code 'exits non-zero'
+    Assert-That ($r.Output -match 'backup directory not found') 'reports the missing backup'
+    Assert-Equal 3 (Get-Pointers $s.OldDir) 'master untouched'
+}
+
+# ---- summary ---------------------------------------------------------------------------
+Write-Host ''
+Write-Host ('-' * 60)
+if ($script:Fail -eq 0) {
+    Write-Host "ALL PASS - $($script:Pass) assertions" -ForegroundColor Green
+    exit 0
+}
+Write-Host "$($script:Pass) passed, $($script:Fail) FAILED" -ForegroundColor Red
+foreach ($f in $script:Failures) { Write-Host "  - $f" -ForegroundColor Red }
+exit 1

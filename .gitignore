@@ -1,0 +1,6 @@
+# Backups contain OAuth tokens (.claude.json) and full chat transcripts.
+# NEVER commit them.
+claude-backup-*/
+claude-backup-*
+*.bak
+sandbox/
