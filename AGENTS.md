@@ -109,6 +109,11 @@ invariants:
 5. Destructive paths pass `Assert-SafeTarget` — under the support dir or a `claude-backup-*`
    directory, nothing else.
 
+## Background
+
+`docs/DESIGN.md` records why the port is built the way it is, including the field failures
+that shaped it. Read it before changing discovery, backup, or the linking logic.
+
 ## Reporting to the user
 
 State what you verified and how. If you claim something is safe, say what you measured.
