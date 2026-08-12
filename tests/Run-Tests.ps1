@@ -137,12 +137,20 @@ function New-Sandbox {
 }
 
 function Invoke-Ccs {
-    param([hashtable]$Sandbox, [string[]]$CcsArgs)
+    param(
+        [hashtable]$Sandbox,
+        [string[]]$CcsArgs,
+        # '0' exercises the real app-detection path instead of short-circuiting it
+        [string]$TestMode = '1',
+        # process name the script treats as "the desktop app"
+        [string]$ProcName
+    )
     $env:CCSWITCH_SUPPORT_DIR = $Sandbox.Support
     $env:CCSWITCH_CLAUDE_DIR  = $Sandbox.Claude
     $env:CCSWITCH_CLAUDE_JSON = $Sandbox.ClaudeJson
     $env:CCSWITCH_BACKUP_ROOT = $Sandbox.Backups
-    $env:CCSWITCH_TEST_MODE   = '1'
+    $env:CCSWITCH_TEST_MODE   = $TestMode
+    if ($ProcName) { $env:CCSWITCH_PROC_NAME = $ProcName }
     try {
         $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath @CcsArgs 2>&1
         $code = $LASTEXITCODE
@@ -150,7 +158,7 @@ function Invoke-Ccs {
     }
     finally {
         Remove-Item env:CCSWITCH_SUPPORT_DIR, env:CCSWITCH_CLAUDE_DIR, env:CCSWITCH_CLAUDE_JSON,
-        env:CCSWITCH_BACKUP_ROOT, env:CCSWITCH_TEST_MODE -ErrorAction SilentlyContinue
+        env:CCSWITCH_BACKUP_ROOT, env:CCSWITCH_TEST_MODE, env:CCSWITCH_PROC_NAME -ErrorAction SilentlyContinue
     }
 }
 
@@ -368,12 +376,105 @@ Test-Case 'T14 the new account is auto-detected when not given' {
     Assert-Equal 5 (Get-Pointers $s.OldDir) 'master intact'
 }
 
-Test-Case 'T15 refuses to touch paths outside the session store' {
+Test-Case 'T15 rollback from a non-existent backup path aborts cleanly' {
+    # NOTE: this does NOT exercise Assert-SafeTarget - it aborts before any guard runs.
+    # The allowlist guard is currently untested; see the design doc's testing section.
     $s = New-Sandbox 't15' -OldCount 3 -NewCount 0
     $r = Invoke-Ccs $s @('-Command', 'rollback', (Join-Path $s.Root 'no-such-backup'))
     Assert-Equal 1 $r.Code 'exits non-zero'
     Assert-That ($r.Output -match 'backup directory not found') 'reports the missing backup'
     Assert-Equal 3 (Get-Pointers $s.OldDir) 'master untouched'
+}
+
+# ---- regression tests for bugs found in adversarial review (2026-08-12) ----------------
+# Every case below runs with CCSWITCH_TEST_MODE=0 where relevant. The original suite set
+# TEST_MODE=1 everywhere, which short-circuited Wait-AppClosed/Get-AppEvidence entirely -
+# so a crash on the app-quit path passed 71/71 while being fatal in real use.
+
+Test-Case 'T16 REGRESSION real mode, app quit: transfer completes' {
+    # Get-AppEvidence returns an empty array -> the caller receives $null -> $null.Count
+    # threw under StrictMode, exactly when the app was correctly quit.
+    $s = New-Sandbox 't16' -OldCount 5 -NewCount 2
+    $r = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace') `
+        -TestMode '0' -ProcName 'ccswitch-no-such-process'
+    Assert-Equal 0 $r.Code 'exit code is 0 with the app not running'
+    Assert-That ($r.Output -notmatch "property 'Count' cannot be found") 'no StrictMode Count crash'
+    Assert-That (Test-Junction $s.NewDir) 'junction created'
+    Assert-Equal 5 (Get-Pointers $s.OldDir) 'master intact'
+}
+
+Test-Case 'T17 REGRESSION real mode, app running: refuses and changes nothing' {
+    # powershell.exe is certainly running - this test host is one
+    $s = New-Sandbox 't17' -OldCount 5 -NewCount 2
+    $r = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace') `
+        -TestMode '0' -ProcName 'powershell'
+    Assert-Equal 1 $r.Code 'exits non-zero'
+    Assert-That ($r.Output -match 'is running') 'reports the app is running'
+    Assert-That ($r.Output -notmatch "property 'Count' cannot be found") 'no StrictMode Count crash'
+    Assert-That (-not (Test-Junction $s.NewDir)) 'no junction created'
+    Assert-Equal 5 (Get-Pointers $s.OldDir) 'master untouched'
+    Assert-Equal 0 (@(Get-ChildItem -LiteralPath $s.Backups -Directory -EA SilentlyContinue).Count) 'no backup written'
+}
+
+Test-Case 'T18 REGRESSION dry run with the app quit does not crash' {
+    $s = New-Sandbox 't18' -OldCount 4 -NewCount 1
+    $r = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace', '-DryRun') `
+        -TestMode '0' -ProcName 'ccswitch-no-such-process'
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That ($r.Output -match 'DRY RUN COMPLETE') 'completed the dry run'
+    Assert-That (-not (Test-Junction $s.NewDir)) 'nothing changed'
+}
+
+Test-Case 'T19 REGRESSION status works with a single account (scalar unroll)' {
+    # one UUID dir per base -> the helper returns a scalar, not an array -> .Count threw
+    $s = New-Sandbox 't19' -OldCount 3 -NoNewOrg
+    $r = Invoke-Ccs $s @('-Command', 'status')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That ($r.Output -notmatch "property 'Count' cannot be found") 'no StrictMode Count crash'
+    Assert-That ($r.Output -match 'master: ') 'still reports the master'
+}
+
+Test-Case 'T20 REGRESSION empty store prints the diagnostic instead of crashing' {
+    $s = New-Sandbox 't20' -OldCount 0 -NoNewOrg
+    Remove-TestTree (Join-Path $s.Support "claude-code-sessions\$OLD_ACC")
+    $r = Invoke-Ccs $s @('-Command', 'status')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That ($r.Output -notmatch "property 'Count' cannot be found") 'no StrictMode Count crash'
+    Assert-That ($r.Output -match 'Discovery found nothing') 'printed the discovery dump'
+    Assert-That ($r.Output -match 'subdirectories : 0') 'dump reports the empty base'
+}
+
+Test-Case 'T21 REGRESSION settings.json is written without a BOM' {
+    $s = New-Sandbox 't21' -OldCount 2 -NewCount 0
+    $r = Invoke-Ccs $s @('-Command', 'retention', '-RetentionDays', '3650')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    $bytes = [IO.File]::ReadAllBytes((Join-Path $s.Claude 'settings.json'))
+    $hasBom = ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    Assert-That (-not $hasBom) 'no UTF-8 BOM (Set-Content -Encoding UTF8 would add one)'
+    Assert-Equal 3650 ((Get-Content -LiteralPath (Join-Path $s.Claude 'settings.json') -Raw | ConvertFrom-Json).cleanupPeriodDays) 'value written'
+}
+
+Test-Case 'T22 REGRESSION the backup captures settings.json before retention edits it' {
+    $s = New-Sandbox 't22' -OldCount 5 -NewCount 0
+    $r = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace', '-RetentionDays', '3650') `
+        -TestMode '0' -ProcName 'ccswitch-no-such-process'
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    $live = Get-Content -LiteralPath (Join-Path $s.Claude 'settings.json') -Raw | ConvertFrom-Json
+    Assert-Equal 3650 $live.cleanupPeriodDays 'live settings.json was updated'
+    $b = Get-Backup $s
+    $saved = Get-Content -LiteralPath (Join-Path $b.FullName 'dot-claude\settings.json') -Raw | ConvertFrom-Json
+    Assert-That (-not ($saved.PSObject.Properties.Name -contains 'cleanupPeriodDays')) 'the backup holds the ORIGINAL settings, so the edit is reversible'
+}
+
+Test-Case 'T23 rollback verifies the restore before discarding the live tree' {
+    $s = New-Sandbox 't23' -OldCount 6 -NewCount 2
+    $null = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace')
+    $b = Get-Backup $s
+    $r = Invoke-Ccs $s @('-Command', 'rollback', $b.FullName)
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That ($r.Output -match 'verified claude-code-sessions : 8/8') 'reports a verified pointer count'
+    Assert-Equal 6 (Get-Pointers $s.OldDir) 'master intact'
+    Assert-Equal 2 (Get-Pointers $s.NewDir) 'new account restored'
 }
 
 # ---- summary ---------------------------------------------------------------------------

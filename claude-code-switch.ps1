@@ -33,7 +33,10 @@
 
 .PARAMETER OnConflict
     What to do when the new account's org folder already holds its own pointers:
-      replace  stash the folder in the backup, delete it, create the junction (Mac parity)
+      replace  stash the folder in the backup, delete it, create the junction.
+               NOTE: this is a Windows-only extension. The macOS original only ever
+               offers merge/skip for a folder that holds its own sessions; it
+               stash-replaces sessionless folders only.
       merge    copy the old account's pointers in; both accounts keep separate lists
       skip     leave it alone
       ask      prompt (default)
@@ -101,6 +104,9 @@ $ClaudeJson = Get-Env 'CCSWITCH_CLAUDE_JSON' (Join-Path $env:USERPROFILE '.claud
 $BackupRoot = Get-Env 'CCSWITCH_BACKUP_ROOT' $env:USERPROFILE
 $TestMode   = (Get-Env 'CCSWITCH_TEST_MODE' '0') -eq '1'
 $UiMode     = Get-Env 'CCSWITCH_UI' 'auto'
+# process name to treat as "the desktop app". Overridable so the test suite can exercise
+# the real (non-TEST_MODE) app-detection path against a process it controls.
+$ProcName   = Get-Env 'CCSWITCH_PROC_NAME' 'claude'
 
 $BASES = @('claude-code-sessions', 'local-agent-mode-sessions')
 $UUID_RE = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
@@ -189,9 +195,18 @@ function New-Junction {
         New-Item -ItemType Junction -Path $LinkPath -Value $TargetPath -ErrorAction Stop | Out-Null
     }
     catch {
-        # older/locked-down hosts: fall back to mklink, which needs no elevation for /J
-        $out = & cmd.exe /c mklink /J $LinkPath $TargetPath 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "could not create junction ${LinkPath}: $out" }
+        # older/locked-down hosts: fall back to mklink, which needs no elevation for /J.
+        # No 2>&1 here: with $ErrorActionPreference='Stop', redirecting a native command's
+        # stderr throws on the first stderr line, which would pre-empt the exit-code check
+        # below and surface a raw NativeCommandError instead of a useful message.
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = & cmd.exe /c mklink /J $LinkPath $TargetPath
+            $rc = $LASTEXITCODE
+        }
+        finally { $ErrorActionPreference = $prev }
+        if ($rc -ne 0) { throw "could not create junction ${LinkPath} (mklink exit $rc): $out" }
     }
     if (-not (Test-IsReparse $LinkPath)) { throw "junction was not created: $LinkPath" }
 }
@@ -331,26 +346,29 @@ function Get-PointerTitles {
 
 # ---- app detection ---------------------------------------------------------------------
 function Get-AppEvidence {
+    <#  Returns one line per running app process. Callers MUST wrap the result in @() -
+        a function returning an empty array hands back $null, and a single-element array
+        hands back a bare string, and under Set-StrictMode both blow up on .Count. #>
     if ($TestMode) { return @() }
-    $procs = @(Get-Process -Name 'claude' -ErrorAction SilentlyContinue)
+    $procs = @(Get-Process -Name $ProcName -ErrorAction SilentlyContinue)
     $out = @()
-    foreach ($p in $procs) { $out += ("    process:   pid {0}  claude.exe" -f $p.Id) }
+    foreach ($p in $procs) { $out += ("    process:   pid {0}  $ProcName.exe" -f $p.Id) }
     return $out
 }
 
 function Wait-AppClosed {
     if ($TestMode) { return }
     while ($true) {
-        $evidence = Get-AppEvidence
+        $evidence = @(Get-AppEvidence)
         if ($evidence.Count -eq 0) { return }
 
         if ($DryRun) {
-            Write-Warn "$($evidence.Count) claude.exe process(es) running - fine for a dry run, but the real run needs the app fully quit"
+            Write-Warn "$($evidence.Count) $ProcName.exe process(es) running - fine for a dry run, but the real run needs the app fully quit"
             return
         }
 
         if ($Force) {
-            Write-Warn "continuing despite $($evidence.Count) running claude.exe process(es) - you asked with -Force"
+            Write-Warn "continuing despite $($evidence.Count) running $ProcName.exe process(es) - you asked with -Force"
             return
         }
         Write-Warn 'The Claude app appears to be running - here is what I detect:'
@@ -379,12 +397,15 @@ function Get-SubDirectories {
     if (-not [IO.Directory]::Exists($LiteralPath)) { return @() }
     return @([IO.Directory]::GetDirectories($LiteralPath))
 }
+# NOTE: a PowerShell function that returns a 0- or 1-element array hands the caller $null
+# or a bare scalar. Under Set-StrictMode, .Count on either throws. Every call site of the
+# collection-returning helpers below wraps the result in @() for that reason.
 
 function Get-AccountDirs {
     param([Parameter(Mandatory)][string]$Base)
     $root = Join-Path $SupportDir $Base
     $out = @()
-    foreach ($d in (Get-SubDirectories $root)) {
+    foreach ($d in @(Get-SubDirectories $root)) {
         $name = [IO.Path]::GetFileName($d)
         if ($name -notmatch $UUID_RE) { continue }
         $out += [pscustomobject]@{
@@ -399,7 +420,7 @@ function Get-AccountDirs {
 function Get-OrgDirs {
     param([Parameter(Mandatory)][string]$AccountPath)
     $out = @()
-    foreach ($d in (Get-SubDirectories $AccountPath)) {
+    foreach ($d in @(Get-SubDirectories $AccountPath)) {
         $name = [IO.Path]::GetFileName($d)
         if ($name -notmatch $UUID_RE) { continue }
         $out += [pscustomobject]@{ Name = $name; FullName = $d }
@@ -418,7 +439,7 @@ function Write-DiscoveryDump {
         Write-Plain "    $base"
         Write-Plain "      path           : $root"
         Write-Plain "      exists         : $([IO.Directory]::Exists($root))"
-        $subs = Get-SubDirectories $root
+        $subs = @(Get-SubDirectories $root)
         Write-Plain "      subdirectories : $($subs.Count)"
         foreach ($s in $subs) {
             $n = [IO.Path]::GetFileName($s)
@@ -442,9 +463,9 @@ function Find-Master {
     $script:OldOrg = ''
     $script:SessCount = 0
 
-    foreach ($acc in (Get-AccountDirs 'claude-code-sessions')) {
+    foreach ($acc in @(Get-AccountDirs 'claude-code-sessions')) {
         if ($OldAccount -and $acc.Name -ne $OldAccount) { continue }
-        foreach ($org in (Get-OrgDirs $acc.FullName)) {
+        foreach ($org in @(Get-OrgDirs $acc.FullName)) {
             if (Test-IsReparse $org.FullName) { continue }   # links are never the master
             $n = Get-PointerCount $org.FullName
             if ($n -gt $best) {
@@ -461,8 +482,8 @@ function Find-Master {
 function Get-LinkedCount {
     $master = Resolve-PhysicalDir (Join-Path $SupportDir "claude-code-sessions\$($script:OldAcc)\$($script:OldOrg)")
     $n = 0
-    foreach ($acc in (Get-AccountDirs 'claude-code-sessions')) {
-        foreach ($org in (Get-OrgDirs $acc.FullName)) {
+    foreach ($acc in @(Get-AccountDirs 'claude-code-sessions')) {
+        foreach ($org in @(Get-OrgDirs $acc.FullName)) {
             if (-not (Test-IsReparse $org.FullName)) { continue }
             if ((Resolve-PhysicalDir $org.FullName) -eq $master) { $n++ }
         }
@@ -605,7 +626,7 @@ function Invoke-LinkOrg {
         $n = Get-PointerCount $newPath
         if ($n -gt 0) {
             Write-Warn "${label}: the new account already has $n session(s) of its own:"
-            foreach ($t in (Get-PointerTitles $newPath)) { Write-Plain "        - $t" }
+            foreach ($t in @(Get-PointerTitles $newPath)) { Write-Plain "        - $t" }
 
             $choice = $OnConflict
             if ($choice -eq 'ask') {
@@ -694,7 +715,11 @@ function Set-Retention {
     if (Test-Path -LiteralPath $settings) { Copy-Item -LiteralPath $settings -Destination "$settings.bak" -Force }
 
     $tmp = "$settings.tmp"
-    ($obj | ConvertTo-Json -Depth 100) | Set-Content -LiteralPath $tmp -Encoding UTF8
+    # WriteAllText with an explicit BOM-less encoder: Set-Content -Encoding UTF8 emits a
+    # UTF-8 BOM on PowerShell 5.1, and a BOM breaks strict JSON.parse readers. The file
+    # Claude ships has no BOM, so neither may ours.
+    $json = ($obj | ConvertTo-Json -Depth 100)
+    [IO.File]::WriteAllText($tmp, $json + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
     # prove the result parses before it replaces the live file
     $null = Get-Content -LiteralPath $tmp -Raw | ConvertFrom-Json
     Move-Item -LiteralPath $tmp -Destination $settings -Force
@@ -730,10 +755,10 @@ function Invoke-Status {
 
     foreach ($base in $BASES) {
         Write-Plain "  $base"
-        $accounts = Get-AccountDirs $base
+        $accounts = @(Get-AccountDirs $base)
         if ($accounts.Count -eq 0) { Write-Plain '    (none)'; continue }
         foreach ($acc in $accounts) {
-            foreach ($org in (Get-OrgDirs $acc.FullName)) {
+            foreach ($org in @(Get-OrgDirs $acc.FullName)) {
                 $kind = 'dir     '
                 $extra = ''
                 if (Test-IsReparse $org.FullName) {
@@ -769,8 +794,6 @@ function Invoke-Transfer {
     Write-Plain "      sessions: $($script:SessCount)"
     Write-Plain ''
 
-    Invoke-RetentionDialog
-
     if (-not $NonInteractive) {
         Write-Plain ''
         Write-Head 'STEP 1/4 - Quit the Claude app completely, including the tray icon.'
@@ -779,6 +802,12 @@ function Invoke-Transfer {
     Wait-AppClosed
 
     $backup = New-Backup
+
+    # Retention edits ~\.claude\settings.json, so it runs AFTER the backup - otherwise a
+    # failure later in the flow would leave a modified settings.json with no copy of the
+    # original in the backup. (The macOS original asks first; it has no verified backup to
+    # order against.)
+    Invoke-RetentionDialog
 
     if (-not $NonInteractive) {
         Write-Plain ''
@@ -844,7 +873,7 @@ no new-account directories on disk yet.
         foreach ($d in @(Get-ChildItem -LiteralPath $stashRoot -Recurse -Directory -Force -ErrorAction SilentlyContinue)) {
             $n = Get-PointerCount $d.FullName
             if ($n -eq 0) { continue }
-            foreach ($t in (Get-PointerTitles $d.FullName)) { Write-Plain "        - $t" }
+            foreach ($t in @(Get-PointerTitles $d.FullName)) { Write-Plain "        - $t" }
             Write-Plain "      Copy-Item '$($d.FullName)\local_*.json' '$SupportDir\claude-code-sessions\$($script:OldAcc)\$($script:OldOrg)\'"
         }
     }
@@ -880,6 +909,19 @@ function Invoke-Rollback {
                 if (Test-Path -LiteralPath $aside) { Move-Item -LiteralPath $aside -Destination $live -Force }
             }
             throw
+        }
+
+        # verify the restore before discarding the state we moved aside
+        if (-not $DryRun) {
+            $want = @(Get-ChildItem -LiteralPath $src -Recurse -Filter 'local_*.json' -File -Force -ErrorAction SilentlyContinue).Count
+            $got = @(Get-ChildItem -LiteralPath $live -Recurse -Filter 'local_*.json' -File -Force -ErrorAction SilentlyContinue).Count
+            if ($got -ne $want) {
+                Write-Err "restore of $base is short ($got of $want pointer files) - putting the previous state back"
+                Remove-TreeSafely $live
+                if (Test-Path -LiteralPath $aside) { Move-Item -LiteralPath $aside -Destination $live -Force }
+                throw "rollback verification failed for $base"
+            }
+            Write-Plain "    verified $base : $got/$want pointer files"
         }
 
         # the moved-aside copy may contain junctions from an earlier run: Remove-TreeSafely

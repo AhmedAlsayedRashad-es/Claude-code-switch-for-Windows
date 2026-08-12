@@ -68,9 +68,14 @@ These rules are the core of the port:
    throws. So this rule does not fix a bug observed on that build. It is kept because the
    blast radius is the master session index, and because the behaviour should be ours
    rather than the platform's.
-2. **Copy never follows reparse points.** `robocopy /XJ`; encountered junctions are
-   recorded in `reparse-manifest.json` in the backup instead of being traversed.
-   `~\.claude` contains 3 such junctions on this machine.
+2. **Copy never follows reparse points.** `robocopy /XJ`; junctions under `~\.claude`
+   (3 on this machine) are recorded in the `reparsePoints` field of `manifest.json`
+   instead of being traversed.
+
+   Known limitation: junctions **inside the session store** are not recorded anywhere. A
+   backup taken after a previous transfer therefore omits the junctioned org directories,
+   and restoring it silently drops the linked state (the app recreates a plain directory).
+   Not relevant to a first run, when no junctions exist yet.
 3. **Refuse to run while `claude.exe` is alive**, with an explicit force override.
    The app holds open handles on the index folder and rewrites it continuously.
 4. **Path allowlist before any destructive step**: the target must resolve under
@@ -104,7 +109,17 @@ Commands: `status`, `transfer`, `rollback <dir>`, `retention`, plus an interacti
    | real dir, N>0 pointers | `-OnConflict`: `replace` (stash+junction), `merge` (copy master's in), `skip` |
 
 **Decision for this machine:** the new account's folder holds 2 live pointers, so the
-`N>0` branch applies and the chosen action is `replace` — exact Mac parity. Consequence,
+`N>0` branch applies and the chosen action is `replace`.
+
+**Correction (2026-08-12, post-review):** `replace` on a folder that holds its own
+sessions was described to the user as "exact Mac parity". That is wrong. The macOS script
+(`claude-code-switch.sh:419-431`) offers only merge/skip when `n>0` and never deletes a
+session-holding directory; it stash-replaces sessionless directories only. `replace` in
+the `N>0` case is a Windows-only extension introduced here. It remains safe (stash +
+verified backup + printed restore command), but the parity justification was false and the
+user's choice was made partly on it.
+
+Consequence,
 accepted explicitly: the sidebar entries *"Claude code-switch for Windows"* and
 *"Restore deleted chats after subscription change"* disappear. Their pointer files are
 preserved at `<backup>\replaced-dirs\...` and the script prints the copy command to
