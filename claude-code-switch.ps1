@@ -98,7 +98,34 @@ function Get-Env([string]$name, [string]$fallback) {
     return $v
 }
 
-$SupportDir = Get-Env 'CCSWITCH_SUPPORT_DIR' (Join-Path $env:APPDATA 'Claude')
+function Resolve-DefaultSupportDir {
+    <#  Where the desktop app really keeps its session index.
+
+        Claude Desktop can be installed as an MSIX/Store package. Store apps run under
+        filesystem virtualization: inside the package container `%APPDATA%\Claude` is
+        redirected to
+            %LOCALAPPDATA%\Packages\<PackageFamily>\LocalCache\Roaming\Claude
+        while a normal shell outside the container sees a `%APPDATA%` with no Claude
+        folder at all. Same path string, two destinations, depending on who is asking.
+
+        The package path is preferred whenever it exists, because it resolves identically
+        from inside and outside the container. That matters beyond discovery: a junction
+        records its target as a literal string, so a junction created with the virtual
+        path would dangle for every process outside the container. #>
+
+    $packagesRoot = Get-Env 'CCSWITCH_PACKAGES_DIR' (Join-Path $env:LOCALAPPDATA 'Packages')
+    if ([IO.Directory]::Exists($packagesRoot)) {
+        foreach ($pkg in [IO.Directory]::GetDirectories($packagesRoot)) {
+            $candidate = Join-Path $pkg 'LocalCache\Roaming\Claude'
+            if ([IO.Directory]::Exists((Join-Path $candidate 'claude-code-sessions'))) {
+                return $candidate
+            }
+        }
+    }
+    return (Join-Path $env:APPDATA 'Claude')
+}
+
+$SupportDir = Get-Env 'CCSWITCH_SUPPORT_DIR' (Resolve-DefaultSupportDir)
 $ClaudeDir  = Get-Env 'CCSWITCH_CLAUDE_DIR'  (Join-Path $env:USERPROFILE '.claude')
 $ClaudeJson = Get-Env 'CCSWITCH_CLAUDE_JSON' (Join-Path $env:USERPROFILE '.claude.json')
 $BackupRoot = Get-Env 'CCSWITCH_BACKUP_ROOT' $env:USERPROFILE
@@ -449,10 +476,24 @@ function Write-DiscoveryDump {
         }
     }
     Write-Plain ''
-    Write-Plain '    If the folders are listed above but the script still says none were found,'
-    Write-Plain '    please report this output. If CCSWITCH_SUPPORT_DIR is set in your shell it'
-    Write-Plain '    overrides the default location:'
+    Write-Plain '    Locations probed for a Store (MSIX) install, where %APPDATA%\Claude is'
+    Write-Plain '    virtualized and only visible from inside the app''s package container:'
+    $packagesRoot = Get-Env 'CCSWITCH_PACKAGES_DIR' (Join-Path $env:LOCALAPPDATA 'Packages')
+    Write-Plain "      packages root  : $packagesRoot (exists: $([IO.Directory]::Exists($packagesRoot)))"
+    $any = $false
+    if ([IO.Directory]::Exists($packagesRoot)) {
+        foreach ($pkg in [IO.Directory]::GetDirectories($packagesRoot)) {
+            $candidate = Join-Path $pkg 'LocalCache\Roaming\Claude'
+            if ([IO.Directory]::Exists($candidate)) {
+                Write-Plain "      candidate      : $candidate"
+                $any = $true
+            }
+        }
+    }
+    if (-not $any) { Write-Plain '      candidate      : none found' }
+    Write-Plain ''
     Write-Plain "      CCSWITCH_SUPPORT_DIR = $([Environment]::GetEnvironmentVariable('CCSWITCH_SUPPORT_DIR'))"
+    Write-Plain '    Set that variable to point the script at the store explicitly.'
 }
 
 function Find-Master {

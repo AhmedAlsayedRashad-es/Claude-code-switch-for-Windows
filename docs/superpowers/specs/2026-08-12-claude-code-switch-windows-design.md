@@ -27,9 +27,31 @@ session-index folder onto the old one. This document specifies a Windows port.
 | What | Where | Per-account? |
 |---|---|---|
 | Transcripts | `%USERPROFILE%\.claude\projects\<proj>\<cliSessionId>.jsonl` | no |
-| Sidebar pointers | `%APPDATA%\Claude\claude-code-sessions\<ACCOUNT>\<ORG>\local_*.json` | yes |
-| Agent-mode sessions | `%APPDATA%\Claude\local-agent-mode-sessions\<ACCOUNT>\<ORG>\` | yes |
+| Sidebar pointers | `<support>\claude-code-sessions\<ACCOUNT>\<ORG>\local_*.json` | yes |
+| Agent-mode sessions | `<support>\local-agent-mode-sessions\<ACCOUNT>\<ORG>\` | yes |
 | Retention setting | `%USERPROFILE%\.claude\settings.json` → `cleanupPeriodDays` | no |
+
+### `<support>` and MSIX virtualization (added 2026-08-12, after a field failure)
+
+On this machine Claude Desktop is the Store package `Claude_pzs8sxrjxfjjc`. Store apps run
+under filesystem virtualization, so `%APPDATA%\Claude` resolves differently depending on
+the caller:
+
+| Caller | `%APPDATA%\Claude` resolves to |
+|---|---|
+| process inside the package container (e.g. a shell spawned by the app) | `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude` |
+| ordinary PowerShell window | nothing — the folder does not exist |
+
+Verified: the same pointer file read through both paths has identical length and MD5.
+`%USERPROFILE%\.claude` is **not** redirected.
+
+This is why the first field run reported "No desktop sessions found" while every check run
+from inside the app succeeded. `Resolve-DefaultSupportDir` now probes
+`%LOCALAPPDATA%\Packages\*\LocalCache\Roaming\Claude` and prefers it.
+
+The physical path is required, not merely preferred: a junction stores its target as a
+literal string, so a junction written with the virtual path would dangle for every process
+outside the container — including the one that later needs to roll it back.
 
 A pointer file carries `cliSessionId`, `cwd`, `title`, `model`, timestamps. It contains
 no account or org identifier, so pointers are portable between account folders.

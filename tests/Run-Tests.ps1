@@ -477,6 +477,34 @@ Test-Case 'T23 rollback verifies the restore before discarding the live tree' {
     Assert-Equal 2 (Get-Pointers $s.NewDir) 'new account restored'
 }
 
+Test-Case 'T24 REGRESSION finds an MSIX/Store install via LocalCache' {
+    # Claude Desktop installed from the Store redirects %APPDATA%\Claude into
+    # %LOCALAPPDATA%\Packages\<pkg>\LocalCache\Roaming\Claude. A shell outside the package
+    # container sees no %APPDATA%\Claude at all, so the default must probe for the package.
+    $s = New-Sandbox 't24' -OldCount 6 -NewCount 0
+    $fakePackages = Join-Path $s.Root 'Packages'
+    $pkgSupport = Join-Path $fakePackages 'Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude'
+    New-Item -ItemType Directory -Force -Path (Split-Path $pkgSupport -Parent) | Out-Null
+    Move-Item -LiteralPath $s.Support -Destination $pkgSupport
+
+    $env:CCSWITCH_PACKAGES_DIR = $fakePackages
+    $env:CCSWITCH_CLAUDE_DIR = $s.Claude
+    $env:CCSWITCH_CLAUDE_JSON = $s.ClaudeJson
+    $env:CCSWITCH_BACKUP_ROOT = $s.Backups
+    $env:CCSWITCH_TEST_MODE = '1'
+    try {
+        # deliberately NOT setting CCSWITCH_SUPPORT_DIR - auto-detection must find it
+        $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath -Command status 2>&1 | Out-String
+        Assert-That ($out -match 'master: ') 'auto-detected the packaged session store'
+        Assert-That ($out -match '6 session') 'read the right pointer count through it'
+        Assert-That ($out -match [regex]::Escape('LocalCache\Roaming\Claude')) 'reports the physical package path, not the virtual one'
+    }
+    finally {
+        Remove-Item env:CCSWITCH_PACKAGES_DIR, env:CCSWITCH_CLAUDE_DIR, env:CCSWITCH_CLAUDE_JSON,
+        env:CCSWITCH_BACKUP_ROOT, env:CCSWITCH_TEST_MODE -ErrorAction SilentlyContinue
+    }
+}
+
 # ---- summary ---------------------------------------------------------------------------
 Write-Host ''
 Write-Host ('-' * 60)

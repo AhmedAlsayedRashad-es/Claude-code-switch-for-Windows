@@ -19,11 +19,32 @@ named after your account.
 | What | Where | Per-account? |
 |---|---|---|
 | Conversations (JSONL transcripts) | `%USERPROFILE%\.claude\projects\<proj>\<uuid>.jsonl` | no |
-| Sidebar entries (title, cwd, model, pointer) | `%APPDATA%\Claude\claude-code-sessions\<ACCOUNT>\<ORG>\local_*.json` | **yes** |
-| Agent-mode sessions | `%APPDATA%\Claude\local-agent-mode-sessions\<ACCOUNT>\<ORG>\` | **yes** |
+| Sidebar entries (title, cwd, model, pointer) | `<support>\claude-code-sessions\<ACCOUNT>\<ORG>\local_*.json` | **yes** |
+| Agent-mode sessions | `<support>\local-agent-mode-sessions\<ACCOUNT>\<ORG>\` | **yes** |
 | Pin order / UI state | Electron localStorage | lost on logout (cosmetic) |
 
 This tool points the new account's folder at the old one, so both share a single list.
+
+### `<support>` — and why it may not be where you expect
+
+For a normal installer, `<support>` is `%APPDATA%\Claude`. **For a Microsoft Store (MSIX)
+install it is not.** Store apps run under filesystem virtualization: inside the package
+container `%APPDATA%\Claude` is silently redirected to
+
+```
+%LOCALAPPDATA%\Packages\<PackageFamilyName>\LocalCache\Roaming\Claude
+```
+
+while an ordinary PowerShell window sees a `%APPDATA%` with **no `Claude` folder at all**.
+The same path string resolves to two different places depending on which process asks.
+
+The script probes `%LOCALAPPDATA%\Packages\*\LocalCache\Roaming\Claude` first and prefers
+it when found, falling back to `%APPDATA%\Claude`. It reports the resolved location in
+`status`, and if discovery fails it prints every path it probed.
+
+This matters for more than discovery. A junction stores its target as a literal string, so
+a junction created with the virtual path would dangle for every process outside the
+container. Junctions are always written with the physical package path.
 
 ## Requirements
 
