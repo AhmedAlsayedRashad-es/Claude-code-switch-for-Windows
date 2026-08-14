@@ -53,7 +53,18 @@ PowerShell window, or trust `status`, which resolves the physical path deliberat
 Junctions store their target as a literal string, so one written with the virtual path
 dangles for every process outside the container.
 
-### 2. `Set-StrictMode` + `.Count` on a function's return value
+### 2. On MSIX installs the app cannot write through a junction
+
+The most damaging bug found so far, and it is silent. After a `replace` transfer on a Store
+install, the app continued writing every other file in its support folder but stopped
+writing session pointers entirely. New chats vanished on restart and renames reverted, for
+two days, before anyone noticed.
+
+If a user reports disappearing or reverting sessions, check the newest `local_*.json` in
+the index against the transfer time. If nothing has been written since, that is this bug.
+The fix is `-Command unshare`. Prefer `-OnConflict merge` on Store installs.
+
+### 3. `Set-StrictMode` + `.Count` on a function's return value
 
 A PowerShell function returning a 0- or 1-element array hands the caller `$null` or a bare
 scalar. Under `Set-StrictMode`, `.Count` on either **throws**. This made the tool crash in
@@ -62,18 +73,18 @@ the exact state it requires (the app quit) while 71 tests passed.
 **Wrap every collection-returning call in `@( )`.** The existing code does; keep it that
 way.
 
-### 3. `CCSWITCH_TEST_MODE=1` hides the app-detection path
+### 4. `CCSWITCH_TEST_MODE=1` hides the app-detection path
 
 It short-circuits `Wait-AppClosed` and `Get-AppEvidence`. Tests that set it prove nothing
 about real-mode behaviour. Use `-TestMode '0' -ProcName 'ccswitch-no-such-process'` in
 `Invoke-Ccs` to exercise the real path with the app simulated as quit.
 
-### 4. `Set-Content -Encoding UTF8` writes a BOM on PowerShell 5.1
+### 5. `Set-Content -Encoding UTF8` writes a BOM on PowerShell 5.1
 
 `settings.json` must stay BOM-free. Use
 `[IO.File]::WriteAllText($p, $json, (New-Object System.Text.UTF8Encoding($false)))`.
 
-### 5. `Get-ChildItem` can be shadowed by a user's profile
+### 6. `Get-ChildItem` can be shadowed by a user's profile
 
 Discovery uses `[IO.Directory]` for this reason. Do not replace it with `Get-ChildItem`,
 and do not add `-ErrorAction SilentlyContinue` to enumeration — a swallowed error looks
@@ -85,7 +96,7 @@ identical to "no sessions found".
 .\tests\Run-Tests.ps1
 ```
 
-104 assertions across 24 cases, entirely against a synthetic sandbox
+116 assertions across 26 cases, entirely against a synthetic sandbox
 (`CCSWITCH_SUPPORT_DIR`). The suite never reads or writes a real session store.
 
 **If you add a safety property, add a test that fails without it.** Verify this by
@@ -97,7 +108,7 @@ Test seams available: `CCSWITCH_SUPPORT_DIR`, `CCSWITCH_CLAUDE_DIR`, `CCSWITCH_C
 
 ## If you change the destructive path
 
-`Invoke-LinkOrg` and `Invoke-Rollback` are the only functions that delete. Preserve these
+`Invoke-LinkOrg`, `Invoke-Unshare` and `Invoke-Rollback` are the only functions that delete. Preserve these
 invariants:
 
 1. A verified backup exists before any mutation. Verification compares pointer-file counts.

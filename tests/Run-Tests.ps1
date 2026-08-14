@@ -505,6 +505,36 @@ Test-Case 'T24 REGRESSION finds an MSIX/Store install via LocalCache' {
     }
 }
 
+Test-Case 'T25 unshare converts junctions back to real directories, keeping the list' {
+    $s = New-Sandbox 't25' -OldCount 5 -NewCount 2
+    $null = Invoke-Ccs $s @('-Command', 'transfer', '-NonInteractive', '-NewAccount', $NEW_ACC, '-OnConflict', 'replace')
+    Assert-That (Test-Junction $s.NewDir) 'precondition: a junction exists'
+
+    $r = Invoke-Ccs $s @('-Command', 'unshare', '-NonInteractive')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That (-not (Test-Junction $s.NewDir)) 'the junction is gone'
+    Assert-That (Test-Path -LiteralPath $s.NewDir) 'a real directory is in its place'
+    Assert-Equal 5 (Get-Pointers $s.NewDir) 'the merged list survived the conversion'
+    Assert-Equal 5 (Get-Pointers $s.OldDir) 'master intact'
+
+    # the whole point: the directory must now be writable in place
+    $probe = Join-Path $s.NewDir 'local_writetest.json'
+    '{"title":"write test"}' | Set-Content -LiteralPath $probe
+    Assert-That (Test-Path -LiteralPath $probe) 'new pointers can be written into it'
+    Remove-Item -LiteralPath $probe -Force
+
+    Assert-That (-not (Test-Path -LiteralPath ($s.NewDir + '.ccswitch-converting'))) 'no staging directory left behind'
+}
+
+Test-Case 'T26 unshare is a no-op when there are no junctions' {
+    $s = New-Sandbox 't26' -OldCount 4 -NewCount 1
+    $r = Invoke-Ccs $s @('-Command', 'unshare', '-NonInteractive')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That ($r.Output -match 'No junctions found') 'reports nothing to do'
+    Assert-Equal 4 (Get-Pointers $s.OldDir) 'master untouched'
+    Assert-Equal 1 (Get-Pointers $s.NewDir) 'new account untouched'
+}
+
 # ---- summary ---------------------------------------------------------------------------
 Write-Host ''
 Write-Host ('-' * 60)

@@ -66,7 +66,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('menu', 'status', 'transfer', 'rollback', 'retention')]
+    [ValidateSet('menu', 'status', 'transfer', 'unshare', 'rollback', 'retention')]
     [string]$Command = 'menu',
 
     [Parameter(Position = 1)]
@@ -956,6 +956,70 @@ no new-account directories on disk yet.
     }
 }
 
+function Invoke-Unshare {
+    <#  Convert every junction in the session store back into a real directory holding a
+        copy of what it pointed at.
+
+        Why this exists: on an MSIX/Store install the desktop app cannot write through a
+        junction in claude-code-sessions. It writes every sibling folder happily, but new
+        session pointers, renames and archive flags silently never land - so new chats
+        vanish from the sidebar on restart. Observed 2026-08-14, two days after a transfer.
+
+        This keeps the merged list (you still see every session) while giving the app a
+        plain directory it can write to again. The cost is the one merge always had: each
+        account now keeps its own list, and they drift apart from here. #>
+
+    $converted = 0
+    foreach ($base in $BASES) {
+        foreach ($acc in @(Get-AccountDirs $base)) {
+            foreach ($org in @(Get-OrgDirs $acc.FullName)) {
+                if (-not (Test-IsReparse $org.FullName)) { continue }
+
+                $target = Resolve-PhysicalDir $org.FullName
+                $label = "$base ($($acc.Name.Substring(0,8))\$($org.Name.Substring(0,8)))"
+
+                if (-not [IO.Directory]::Exists($target)) {
+                    Write-Warn "${label}: link is broken (target missing) - removing the link only."
+                    Remove-Link $org.FullName
+                    continue
+                }
+
+                $want = Get-PointerCount $target
+                Write-Info "${label}: converting link -> real directory ($want pointer(s))"
+
+                # stage beside the link, so the swap is a rename on the same volume
+                $staging = $org.FullName + '.ccswitch-converting'
+                if (Test-Path -LiteralPath $staging) { Remove-TreeSafely $staging }
+                Copy-TreeSafely -Source $target -Destination $staging
+
+                if (-not $DryRun) {
+                    $got = Get-PointerCount $staging
+                    if ($got -ne $want) { throw "${label}: staged $got of $want pointers - nothing was changed" }
+                }
+
+                Remove-Link $org.FullName
+                Write-Act "rename: $staging -> $($org.FullName)"
+                if (-not $DryRun) {
+                    Move-Item -LiteralPath $staging -Destination $org.FullName -Force
+                    $final = Get-PointerCount $org.FullName
+                    if ($final -ne $want) { throw "${label}: ended with $final of $want pointers" }
+                    if (Test-IsReparse $org.FullName) { throw "${label}: still a link after conversion" }
+                }
+                Write-Info "${label}: now a real directory with $want pointer(s)."
+                $converted++
+            }
+        }
+    }
+
+    if ($converted -eq 0) {
+        Write-Info 'No junctions found - the session store already uses plain directories.'
+        return
+    }
+    Write-Plain ''
+    Write-Info "Converted $converted link(s). The app can write to its session index again."
+    Write-Plain 'Each account now keeps its own list, so they will drift apart from here.'
+}
+
 function Invoke-Rollback {
     param([Parameter(Mandatory)][string]$BackupDir)
 
@@ -1062,6 +1126,11 @@ try {
     switch ($Command) {
         'status' { Invoke-Status }
         'transfer' { Invoke-Transfer }
+        'unshare' {
+            Wait-AppClosed
+            $null = New-Backup
+            Invoke-Unshare
+        }
         'retention' { Invoke-RetentionDialog }
         'rollback' {
             if (-not $Path) { throw "usage: .\claude-code-switch.ps1 rollback <backup-dir>" }

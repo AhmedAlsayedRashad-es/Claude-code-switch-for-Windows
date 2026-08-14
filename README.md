@@ -19,6 +19,28 @@ share a single list.
 > **Unofficial.** Not affiliated with or endorsed by Anthropic. Use it with your own
 > account(s) and within Anthropic's Terms of Service.
 
+> ## ⚠️ Read this before using `-OnConflict replace`
+>
+> **On a Microsoft Store (MSIX) install, the desktop app cannot write through a junction.**
+> Measured on 2026-08-14, two days after a successful transfer: the app kept writing every
+> other file in its support folder, but not a single new session pointer landed in
+> `claude-code-sessions`. The symptoms are quiet and easy to misread —
+>
+> - new chats appear while you work, then vanish from the sidebar on restart
+> - renaming a chat appears to work, then reverts
+> - the sidebar looks frozen at the moment you ran the transfer
+>
+> Transcripts are never affected; only the index is. But you lose sidebar access to every
+> new chat until you undo it.
+>
+> **If this is happening to you:** quit the app and run `.\claude-code-switch.ps1 unshare`.
+> It converts the junctions back into real directories while keeping the merged list, so
+> you keep your restored sessions *and* the app can write again.
+>
+> **On a Store install, prefer `-OnConflict merge`** — it copies pointers instead of
+> linking, so no junction is ever created. The cost is that each account keeps its own
+> list from then on.
+
 ---
 
 ## Quick start
@@ -96,6 +118,7 @@ including a later rollback.
 |---|---|
 | `status` | Read-only: accounts, pointer counts, junctions, resolved paths, retention |
 | `transfer` | Back up, then link the new account onto the old one |
+| `unshare` | Convert junctions back into real directories, keeping the merged list |
 | `rollback <dir>` | Restore the session indexes from a backup |
 | `retention` | Set `cleanupPeriodDays` in `~\.claude\settings.json` |
 | *(no argument)* | Interactive menu |
@@ -202,7 +225,7 @@ window.
 .\tests\Run-Tests.ps1
 ```
 
-104 assertions across 24 cases, run entirely against a synthetic sandbox — the suite never
+116 assertions across 26 cases, run entirely against a synthetic sandbox — the suite never
 reads or writes a real session store. It covers junction creation and repair, all three
 conflict modes, idempotent re-runs, backup-verification failure, dry-run inertness,
 rollback, MSIX path resolution, and the real (non-test-mode) app-detection path.
