@@ -582,6 +582,37 @@ Test-Case 'T28b reindex accepts a comma-joined id list (how -File passes arrays)
     Assert-Equal 4 (Get-Pointers $s.OldDir) 'both pointers were rebuilt'
 }
 
+Test-Case 'T28c reindex -All rebuilds everything missing and skips subagents' {
+    $s = New-Sandbox 't28c' -OldCount 2 -NewCount 0
+    $proj = Join-Path $s.Claude 'projects\D--bulk'
+    $sub = Join-Path $proj 'subagents'
+    New-Item -ItemType Directory -Force -Path $sub | Out-Null
+    foreach ($i in 1..3) {
+        $id = "22220000-0000-4000-8000-00000000000$i"
+        @("{`"type`":`"custom-title`",`"customTitle`":`"bulk $i`",`"sessionId`":`"$id`"}",
+            '{"type":"user","cwd":"D:\\bulk","timestamp":"2026-08-14T10:00:00.000Z","message":{"role":"user","content":"hi"}}') |
+        Set-Content -LiteralPath (Join-Path $proj "$id.jsonl") -Encoding UTF8
+    }
+    '{"type":"user","timestamp":"2026-08-14T10:00:00.000Z","message":{"role":"user","content":"internal"}}' |
+    Set-Content -LiteralPath (Join-Path $sub '33330000-0000-4000-8000-000000000001.jsonl') -Encoding UTF8
+
+    $r = Invoke-Ccs $s @('-Command', 'reindex', '-All')
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    # 2 existing + 3 bulk + the fixture.jsonl every sandbox seeds = 6; the subagents
+    # transcript must NOT be among them
+    Assert-Equal 6 (Get-Pointers $s.OldDir) '2 existing + 4 rebuilt'
+    Assert-That ($r.Output -match 'Found 4 session') 'counted only the real sessions'
+    Assert-That ($r.Output -notmatch '33330000') 'ignored the subagents transcript'
+}
+
+Test-Case 'T28d reindex without -All or -SessionId refuses with usage' {
+    $s = New-Sandbox 't28d' -OldCount 2 -NewCount 0
+    $r = Invoke-Ccs $s @('-Command', 'reindex')
+    Assert-Equal 1 $r.Code 'exits non-zero'
+    Assert-That ($r.Output -match 'usage') 'prints usage'
+    Assert-Equal 2 (Get-Pointers $s.OldDir) 'nothing changed'
+}
+
 Test-Case 'T28 reindex will not duplicate an existing sidebar entry' {
     $s = New-Sandbox 't28' -OldCount 3 -NewCount 0
     $p = @(Get-ChildItem -LiteralPath $s.OldDir -Filter 'local_*.json')[0]

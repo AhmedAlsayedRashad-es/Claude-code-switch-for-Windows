@@ -78,6 +78,12 @@ param(
     # for 'reindex': cliSessionId values (the .jsonl filenames) to rebuild pointers for
     [string[]]$SessionId,
 
+    # for 'reindex': rebuild every session that has a transcript but no sidebar entry
+    [switch]$All,
+
+    # for 'reindex': only consider sessions touched in the last N days (0 = no limit)
+    [int]$SinceDays = 0,
+
     [ValidateSet('replace', 'merge', 'skip', 'ask')]
     [string]$OnConflict = 'ask',
 
@@ -1007,7 +1013,11 @@ function Invoke-Reindex {
         Deliberately takes explicit session ids. There are typically far more transcripts
         than sidebar entries, so a blanket rebuild would flood the sidebar with hundreds of
         entries the user never had. #>
-    param([Parameter(Mandatory)][string[]]$SessionIds)
+    param(
+        [string[]]$SessionIds,
+        [switch]$RebuildAll,
+        [int]$OlderThanDays = 0
+    )
 
     if (-not (Find-Master)) { throw "No desktop sessions found in: $SupportDir\claude-code-sessions" }
     $master = Join-Path $SupportDir "claude-code-sessions\$($script:OldAcc)\$($script:OldOrg)"
@@ -1029,6 +1039,29 @@ function Invoke-Reindex {
 
     $projects = Join-Path $ClaudeDir 'projects'
     $made = 0
+
+    # No explicit ids: find every transcript that has no sidebar entry. Sessions under a
+    # 'subagents' folder are internal machinery, not chats, and never belonged in the
+    # sidebar - on this machine they are 313 of the 422 unindexed transcripts.
+    if (-not $SessionIds -or $SessionIds.Count -eq 0) {
+        if (-not $RebuildAll) { throw 'reindex needs either -SessionId <id>[,<id>] or -All' }
+
+        $cutoff = [datetime]::MinValue
+        if ($OlderThanDays -gt 0) { $cutoff = (Get-Date).AddDays(-$OlderThanDays) }
+
+        Write-Info 'Scanning transcripts for sessions with no sidebar entry...'
+        $found = @()
+        foreach ($f in [IO.Directory]::GetFiles($projects, '*.jsonl', 'AllDirectories')) {
+            $id = [IO.Path]::GetFileNameWithoutExtension($f)
+            if ($existing.ContainsKey($id)) { continue }
+            if ((Split-Path (Split-Path $f -Parent) -Leaf) -eq 'subagents') { continue }
+            if ([IO.File]::GetLastWriteTime($f) -lt $cutoff) { continue }
+            $found += $id
+        }
+        $SessionIds = $found
+        Write-Info "Found $($SessionIds.Count) session(s) to rebuild."
+        if ($SessionIds.Count -eq 0) { return }
+    }
 
     foreach ($id in $SessionIds) {
         if ($existing.ContainsKey($id)) {
@@ -1258,7 +1291,9 @@ try {
             Invoke-Unshare
         }
         'reindex' {
-            if (-not $SessionId) { throw 'usage: -Command reindex -SessionId <cliSessionId>[,<cliSessionId>]' }
+            if (-not $SessionId -and -not $All) {
+                throw 'usage: -Command reindex -All [-SinceDays <n>]   or   -SessionId <cliSessionId>[,<cliSessionId>]'
+            }
             # powershell.exe -File passes every argument as a plain string, so a
             # comma-separated list arrives as one element. Split it back out.
             $ids = @()
@@ -1269,7 +1304,7 @@ try {
                 }
             }
             Wait-AppClosed
-            Invoke-Reindex -SessionIds $ids
+            Invoke-Reindex -SessionIds $ids -RebuildAll:$All -OlderThanDays $SinceDays
         }
         'retention' { Invoke-RetentionDialog }
         'rollback' {
