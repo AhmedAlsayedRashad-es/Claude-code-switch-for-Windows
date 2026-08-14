@@ -96,7 +96,7 @@ identical to "no sessions found".
 .\tests\Run-Tests.ps1
 ```
 
-116 assertions across 26 cases, entirely against a synthetic sandbox
+130 assertions across 29 cases, entirely against a synthetic sandbox
 (`CCSWITCH_SUPPORT_DIR`). The suite never reads or writes a real session store.
 
 **If you add a safety property, add a test that fails without it.** Verify this by

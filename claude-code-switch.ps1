@@ -66,7 +66,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('menu', 'status', 'transfer', 'unshare', 'rollback', 'retention')]
+    [ValidateSet('menu', 'status', 'transfer', 'unshare', 'reindex', 'rollback', 'retention')]
     [string]$Command = 'menu',
 
     [Parameter(Position = 1)]
@@ -74,6 +74,9 @@ param(
 
     [string]$OldAccount,
     [string]$NewAccount,
+
+    # for 'reindex': cliSessionId values (the .jsonl filenames) to rebuild pointers for
+    [string[]]$SessionId,
 
     [ValidateSet('replace', 'merge', 'skip', 'ask')]
     [string]$OnConflict = 'ask',
@@ -956,6 +959,129 @@ no new-account directories on disk yet.
     }
 }
 
+function Get-TranscriptMetadata {
+    <# Pull everything a sidebar pointer needs out of a .jsonl transcript. #>
+    param([Parameter(Mandatory)][string]$TranscriptPath)
+
+    $title = $null; $cwd = $null; $model = $null
+    $turns = 0; $first = $null; $last = $null
+
+    foreach ($line in [IO.File]::ReadLines($TranscriptPath)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try { $j = $line | ConvertFrom-Json } catch { continue }
+        $names = $j.PSObject.Properties.Name
+        # a rename is recorded in the transcript itself, so user titles survive
+        if ($names -contains 'customTitle' -and $j.customTitle) { $title = [string]$j.customTitle }
+        if ($names -contains 'cwd' -and $j.cwd -and -not $cwd) { $cwd = [string]$j.cwd }
+        if ($names -contains 'timestamp' -and $j.timestamp) {
+            if (-not $first) { $first = $j.timestamp }
+            $last = $j.timestamp
+        }
+        if ($names -contains 'type' -and $j.type -eq 'user') { $turns++ }
+        if ($names -contains 'message' -and $j.message -and
+            ($j.message.PSObject.Properties.Name -contains 'model') -and $j.message.model) {
+            $model = [string]$j.message.model
+        }
+    }
+
+    function ToEpochMs($t) {
+        if (-not $t) { return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+        return [DateTimeOffset]::Parse($t).ToUnixTimeMilliseconds()
+    }
+
+    return [pscustomobject]@{
+        Title     = $title
+        Cwd       = $cwd
+        Model     = $model
+        Turns     = $turns
+        CreatedAt = (ToEpochMs $first)
+        LastAt    = (ToEpochMs $last)
+    }
+}
+
+function Invoke-Reindex {
+    <#  Rebuild sidebar pointers for sessions whose transcripts exist but whose pointer is
+        gone - pruned by cleanupPeriodDays, lost to the MSIX junction bug, or never written
+        because the session came from the CLI.
+
+        Deliberately takes explicit session ids. There are typically far more transcripts
+        than sidebar entries, so a blanket rebuild would flood the sidebar with hundreds of
+        entries the user never had. #>
+    param([Parameter(Mandatory)][string[]]$SessionIds)
+
+    if (-not (Find-Master)) { throw "No desktop sessions found in: $SupportDir\claude-code-sessions" }
+    $master = Join-Path $SupportDir "claude-code-sessions\$($script:OldAcc)\$($script:OldOrg)"
+
+    # index existing pointers so we never create a duplicate
+    $existing = @{}
+    foreach ($f in [IO.Directory]::GetFiles($master, 'local_*.json')) {
+        try {
+            $j = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+            if ($j.cliSessionId) { $existing[[string]$j.cliSessionId] = $j.title }
+        }
+        catch {}
+    }
+
+    # a real pointer is the schema template, so we match whatever the app expects
+    $templateFile = @([IO.Directory]::GetFiles($master, 'local_*.json'))[0]
+    if (-not $templateFile) { throw 'no existing pointer to use as a template' }
+    $template = Get-Content -LiteralPath $templateFile -Raw | ConvertFrom-Json
+
+    $projects = Join-Path $ClaudeDir 'projects'
+    $made = 0
+
+    foreach ($id in $SessionIds) {
+        if ($existing.ContainsKey($id)) {
+            Write-Info "$id : already in the sidebar as '$($existing[$id])' - skipping."
+            continue
+        }
+        $hits = @([IO.Directory]::GetFiles($projects, "$id.jsonl", 'AllDirectories'))
+        if ($hits.Count -eq 0) { Write-Warn "$id : no transcript found under $projects - skipping."; continue }
+
+        $meta = Get-TranscriptMetadata $hits[0]
+        $title = $meta.Title
+        $source = 'user'
+        if (-not $title) { $title = "Recovered session $id"; $source = 'auto' }
+        $cwd = $meta.Cwd
+        if (-not $cwd) { $cwd = Split-Path $hits[0] -Parent }
+
+        # Assigning an absent property on a PSCustomObject throws, so go through
+        # Add-Member -Force, which both adds and overwrites. The template supplies whatever
+        # extra fields this app version expects; we only override the ones we know.
+        $p = $template.PSObject.Copy()
+        $set = {
+            param($obj, $name, $value)
+            $obj | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
+        }
+        & $set $p 'sessionId'      ('local_' + [guid]::NewGuid().ToString())
+        & $set $p 'cliSessionId'   $id
+        & $set $p 'cwd'            $cwd
+        & $set $p 'originCwd'      $cwd
+        & $set $p 'title'          $title
+        & $set $p 'titleSource'    $source
+        & $set $p 'createdAt'      $meta.CreatedAt
+        & $set $p 'lastActivityAt' $meta.LastAt
+        & $set $p 'lastFocusedAt'  $meta.LastAt
+        & $set $p 'completedTurns' $meta.Turns
+        & $set $p 'isArchived'     $false
+        & $set $p 'promptSuggestion' ''
+        if ($meta.Model) { & $set $p 'model' $meta.Model }
+
+        $dest = Join-Path $master ($p.sessionId + '.json')
+        Write-Act "create pointer: '$title' -> $dest"
+        if (-not $DryRun) {
+            $json = $p | ConvertTo-Json -Depth 100
+            [IO.File]::WriteAllText($dest, $json, (New-Object System.Text.UTF8Encoding($false)))
+            $null = Get-Content -LiteralPath $dest -Raw | ConvertFrom-Json   # prove it parses
+        }
+        Write-Info "$id : restored as '$title' ($($meta.Turns) turns, cwd $cwd)"
+        $made++
+    }
+
+    Write-Plain ''
+    Write-Info "Rebuilt $made pointer(s). Restart the app to see them."
+}
+
 function Invoke-Unshare {
     <#  Convert every junction in the session store back into a real directory holding a
         copy of what it pointed at.
@@ -1130,6 +1256,20 @@ try {
             Wait-AppClosed
             $null = New-Backup
             Invoke-Unshare
+        }
+        'reindex' {
+            if (-not $SessionId) { throw 'usage: -Command reindex -SessionId <cliSessionId>[,<cliSessionId>]' }
+            # powershell.exe -File passes every argument as a plain string, so a
+            # comma-separated list arrives as one element. Split it back out.
+            $ids = @()
+            foreach ($chunk in $SessionId) {
+                foreach ($one in ($chunk -split '[,;\s]+')) {
+                    $one = $one.Trim()
+                    if ($one) { $ids += $one }
+                }
+            }
+            Wait-AppClosed
+            Invoke-Reindex -SessionIds $ids
         }
         'retention' { Invoke-RetentionDialog }
         'rollback' {

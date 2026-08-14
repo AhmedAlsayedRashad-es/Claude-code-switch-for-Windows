@@ -535,6 +535,63 @@ Test-Case 'T26 unshare is a no-op when there are no junctions' {
     Assert-Equal 1 (Get-Pointers $s.NewDir) 'new account untouched'
 }
 
+Test-Case 'T27 reindex rebuilds a pointer from a transcript' {
+    $s = New-Sandbox 't27' -OldCount 3 -NewCount 0
+    $id = '7f3c1a20-0000-4000-8000-abcdefabcdef'
+    $proj = Join-Path $s.Claude 'projects\D--somewhere'
+    New-Item -ItemType Directory -Force -Path $proj | Out-Null
+    @(
+        '{"type":"custom-title","customTitle":"A recovered chat","sessionId":"' + $id + '"}'
+        '{"type":"user","cwd":"D:\\somewhere","timestamp":"2026-08-14T10:00:00.000Z","message":{"role":"user","content":"hi"}}'
+        '{"type":"assistant","timestamp":"2026-08-14T10:05:00.000Z","message":{"role":"assistant","model":"claude-opus-5","content":"yo"}}'
+        '{"type":"user","timestamp":"2026-08-14T10:06:00.000Z","message":{"role":"user","content":"more"}}'
+    ) | Set-Content -LiteralPath (Join-Path $proj "$id.jsonl") -Encoding UTF8
+
+    $r = Invoke-Ccs $s @('-Command', 'reindex', '-SessionId', $id)
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-Equal 4 (Get-Pointers $s.OldDir) 'a fourth pointer appeared'
+
+    $made = Get-ChildItem -LiteralPath $s.OldDir -Filter 'local_*.json' |
+    ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json } |
+    Where-Object { $_.cliSessionId -eq $id }
+    Assert-That ($null -ne $made) 'the new pointer references the transcript'
+    Assert-Equal 'A recovered chat' $made.title 'title recovered from the custom-title record'
+    Assert-Equal 'user' $made.titleSource 'marked as a user title so the app keeps it'
+    Assert-Equal 'D:\somewhere' $made.cwd 'cwd recovered from the transcript'
+    Assert-Equal 'claude-opus-5' $made.model 'model recovered'
+    Assert-Equal 2 $made.completedTurns 'turn count derived'
+
+    $bytes = [IO.File]::ReadAllBytes((Get-ChildItem -LiteralPath $s.OldDir -Filter 'local_*.json' |
+            Where-Object { (Get-Content $_.FullName -Raw) -match [regex]::Escape($id) } | Select-Object -First 1).FullName)
+    Assert-That (-not ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)) 'written without a BOM'
+}
+
+Test-Case 'T28b reindex accepts a comma-joined id list (how -File passes arrays)' {
+    $s = New-Sandbox 't28b' -OldCount 2 -NewCount 0
+    $proj = Join-Path $s.Claude 'projects\D--multi'
+    New-Item -ItemType Directory -Force -Path $proj | Out-Null
+    $ids = @('11110000-0000-4000-8000-000000000001', '11110000-0000-4000-8000-000000000002')
+    foreach ($i in $ids) {
+        @("{`"type`":`"custom-title`",`"customTitle`":`"chat $i`",`"sessionId`":`"$i`"}",
+            '{"type":"user","cwd":"D:\\multi","timestamp":"2026-08-14T10:00:00.000Z","message":{"role":"user","content":"hi"}}') |
+        Set-Content -LiteralPath (Join-Path $proj "$i.jsonl") -Encoding UTF8
+    }
+    # exactly what the shell hands over for: -SessionId 'a','b'
+    $r = Invoke-Ccs $s @('-Command', 'reindex', '-SessionId', ($ids -join ','))
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-Equal 4 (Get-Pointers $s.OldDir) 'both pointers were rebuilt'
+}
+
+Test-Case 'T28 reindex will not duplicate an existing sidebar entry' {
+    $s = New-Sandbox 't28' -OldCount 3 -NewCount 0
+    $p = @(Get-ChildItem -LiteralPath $s.OldDir -Filter 'local_*.json')[0]
+    $existingId = (Get-Content $p.FullName -Raw | ConvertFrom-Json).cliSessionId
+    $r = Invoke-Ccs $s @('-Command', 'reindex', '-SessionId', $existingId)
+    Assert-Equal 0 $r.Code 'exit code is 0'
+    Assert-That ($r.Output -match 'already in the sidebar') 'reports the duplicate'
+    Assert-Equal 3 (Get-Pointers $s.OldDir) 'no pointer was added'
+}
+
 # ---- summary ---------------------------------------------------------------------------
 Write-Host ''
 Write-Host ('-' * 60)

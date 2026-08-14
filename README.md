@@ -119,6 +119,7 @@ including a later rollback.
 | `status` | Read-only: accounts, pointer counts, junctions, resolved paths, retention |
 | `transfer` | Back up, then link the new account onto the old one |
 | `unshare` | Convert junctions back into real directories, keeping the merged list |
+| `reindex` | Rebuild sidebar pointers for sessions whose transcripts exist but whose entry is gone |
 | `rollback <dir>` | Restore the session indexes from a backup |
 | `retention` | Set `cleanupPeriodDays` in `~\.claude\settings.json` |
 | *(no argument)* | Interactive menu |
@@ -147,6 +148,20 @@ junction can't simply be dropped on top of it:
 
 Want a single shared list containing everything? Use `replace`, then run the `Copy-Item`
 line the script prints, which puts the stashed pointers into the shared folder.
+
+### Recovering a session that vanished from the sidebar
+
+If a chat is missing from the sidebar but its transcript still exists, rebuild the pointer
+from the transcript itself. Titles, working directory, model and turn count are all
+recovered; a rename you made is recovered too, because it is recorded in the transcript.
+
+```powershell
+.\claude-code-switch.ps1 -Command reindex -SessionId <cliSessionId>[,<cliSessionId>]
+```
+
+The id is the `.jsonl` filename under `%USERPROFILE%\.claude\projects\<project>\`. Restart
+the app afterwards. It takes explicit ids on purpose: there are usually far more
+transcripts than sidebar entries, and a blanket rebuild would flood your sidebar.
 
 ### Non-interactive use
 
@@ -225,7 +240,7 @@ window.
 .\tests\Run-Tests.ps1
 ```
 
-116 assertions across 26 cases, run entirely against a synthetic sandbox — the suite never
+130 assertions across 29 cases, run entirely against a synthetic sandbox — the suite never
 reads or writes a real session store. It covers junction creation and repair, all three
 conflict modes, idempotent re-runs, backup-verification failure, dry-run inertness,
 rollback, MSIX path resolution, and the real (non-test-mode) app-detection path.
