@@ -582,27 +582,47 @@ Test-Case 'T28b reindex accepts a comma-joined id list (how -File passes arrays)
     Assert-Equal 4 (Get-Pointers $s.OldDir) 'both pointers were rebuilt'
 }
 
-Test-Case 'T28c reindex -All rebuilds everything missing and skips subagents' {
+Test-Case 'T28c reindex -All restores chats, not every transcript slice' {
+    # A conversation leaves many .jsonl files behind. Only the real chats belong in the
+    # sidebar - one entry each, pointing at the newest slice.
     $s = New-Sandbox 't28c' -OldCount 2 -NewCount 0
     $proj = Join-Path $s.Claude 'projects\D--bulk'
     $sub = Join-Path $proj 'subagents'
     New-Item -ItemType Directory -Force -Path $sub | Out-Null
-    foreach ($i in 1..3) {
-        $id = "22220000-0000-4000-8000-00000000000$i"
-        @("{`"type`":`"custom-title`",`"customTitle`":`"bulk $i`",`"sessionId`":`"$id`"}",
-            '{"type":"user","cwd":"D:\\bulk","timestamp":"2026-08-14T10:00:00.000Z","message":{"role":"user","content":"hi"}}') |
-        Set-Content -LiteralPath (Join-Path $proj "$id.jsonl") -Encoding UTF8
+
+    function Write-Fixture([string]$path, [string]$title, [int]$turns, [string]$firstText) {
+        $lines = @()
+        if ($title) { $lines += "{`"type`":`"custom-title`",`"customTitle`":`"$title`",`"sessionId`":`"x`"}" }
+        for ($i = 1; $i -le $turns; $i++) {
+            $txt = if ($i -eq 1 -and $firstText) { $firstText } else { "turn $i" }
+            $lines += '{"type":"user","cwd":"D:\\bulk","timestamp":"2026-08-14T10:0' + $i + ':00.000Z","message":{"role":"user","content":"' + $txt + '"}}'
+        }
+        $lines | Set-Content -LiteralPath $path -Encoding UTF8
     }
-    '{"type":"user","timestamp":"2026-08-14T10:00:00.000Z","message":{"role":"user","content":"internal"}}' |
-    Set-Content -LiteralPath (Join-Path $sub '33330000-0000-4000-8000-000000000001.jsonl') -Encoding UTF8
+
+    # two real, distinct chats
+    Write-Fixture (Join-Path $proj 'aaaa0000-0000-4000-8000-000000000001.jsonl') 'real chat one' 4 $null
+    Write-Fixture (Join-Path $proj 'aaaa0000-0000-4000-8000-000000000002.jsonl') 'real chat two' 5 $null
+    # two slices of ONE chat - only the newer may come back
+    Write-Fixture (Join-Path $proj 'bbbb0000-0000-4000-8000-000000000001.jsonl') 'sliced chat' 4 $null
+    Write-Fixture (Join-Path $proj 'bbbb0000-0000-4000-8000-000000000002.jsonl') 'sliced chat' 6 $null
+    (Get-Item (Join-Path $proj 'bbbb0000-0000-4000-8000-000000000001.jsonl')).LastWriteTime = (Get-Date).AddDays(-2)
+    # a compaction continuation, an untitled transcript, a 1-turn fragment, a subagent
+    Write-Fixture (Join-Path $proj 'cccc0000-0000-4000-8000-000000000001.jsonl') 'continued chat' 4 'This session is being continued from a previous conversation that ran out of context.'
+    Write-Fixture (Join-Path $proj 'dddd0000-0000-4000-8000-000000000001.jsonl') $null 4 $null
+    Write-Fixture (Join-Path $proj 'eeee0000-0000-4000-8000-000000000001.jsonl') 'too short' 1 $null
+    Write-Fixture (Join-Path $sub 'ffff0000-0000-4000-8000-000000000001.jsonl') 'subagent work' 4 $null
 
     $r = Invoke-Ccs $s @('-Command', 'reindex', '-All')
     Assert-Equal 0 $r.Code 'exit code is 0'
-    # 2 existing + 3 bulk + the fixture.jsonl every sandbox seeds = 6; the subagents
-    # transcript must NOT be among them
-    Assert-Equal 6 (Get-Pointers $s.OldDir) '2 existing + 4 rebuilt'
-    Assert-That ($r.Output -match 'Found 4 session') 'counted only the real sessions'
-    Assert-That ($r.Output -notmatch '33330000') 'ignored the subagents transcript'
+    Assert-That ($r.Output -match 'Found 3 chat') 'restored 3 chats, not 8 transcripts'
+    Assert-Equal 5 (Get-Pointers $s.OldDir) '2 existing + 3 rebuilt'
+    Assert-That ($r.Output -match 'collapsed 1 older slice') 'collapsed the duplicate slice'
+    Assert-That ($r.Output -notmatch 'ffff0000') 'skipped the subagent transcript'
+    Assert-That ($r.Output -notmatch 'cccc0000') 'skipped the compaction continuation'
+    Assert-That ($r.Output -notmatch 'dddd0000') 'skipped the untitled transcript'
+    Assert-That ($r.Output -notmatch 'eeee0000') 'skipped the 1-turn fragment'
+    Assert-That ($r.Output -match 'bbbb0000-0000-4000-8000-000000000002') 'kept the NEWER slice of the sliced chat'
 }
 
 Test-Case 'T28d reindex without -All or -SessionId refuses with usage' {

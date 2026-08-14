@@ -1005,6 +1005,36 @@ function Get-TranscriptMetadata {
     }
 }
 
+function Get-TranscriptShape {
+    <#  Cheap classification of a transcript: is it a real chat, or one more slice of one?
+        Reads only the head of the file - the markers all appear early. #>
+    param([Parameter(Mandatory)][string]$TranscriptPath)
+
+    $title = $null; $isCont = $false; $turns = 0; $n = 0
+    foreach ($line in [IO.File]::ReadLines($TranscriptPath)) {
+        $n++
+        if ($n -gt 400) { break }
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try { $j = $line | ConvertFrom-Json } catch { continue }
+        $p = $j.PSObject.Properties.Name
+
+        if ($p -contains 'customTitle' -and $j.customTitle) { $title = [string]$j.customTitle }
+        if ($p -contains 'isCompactSummary' -and $j.isCompactSummary) { $isCont = $true }
+        if ($p -contains 'type' -and $j.type -eq 'user') {
+            $turns++
+            if (-not $isCont -and $turns -eq 1 -and ($p -contains 'message') -and $j.message) {
+                $c = $j.message.content
+                $txt = if ($c -is [string]) { $c }
+                else { ($c | Where-Object { $_.type -eq 'text' } | Select-Object -First 1).text }
+                if ($txt -and $txt -match 'This session is being continued from a previous conversation') {
+                    $isCont = $true
+                }
+            }
+        }
+    }
+    return [pscustomobject]@{ Title = $title; IsContinuation = $isCont; Turns = $turns }
+}
+
 function Invoke-Reindex {
     <#  Rebuild sidebar pointers for sessions whose transcripts exist but whose pointer is
         gone - pruned by cleanupPeriodDays, lost to the MSIX junction bug, or never written
@@ -1049,17 +1079,52 @@ function Invoke-Reindex {
         $cutoff = [datetime]::MinValue
         if ($OlderThanDays -gt 0) { $cutoff = (Get-Date).AddDays(-$OlderThanDays) }
 
-        Write-Info 'Scanning transcripts for sessions with no sidebar entry...'
-        $found = @()
+        <#  A transcript file is NOT the same thing as a chat. One conversation leaves
+            many .jsonl files behind: every compaction starts a new one, sidechains get
+            their own, and short fragments litter the folder. On the machine this was
+            written against, 109 unindexed transcripts boiled down to a handful of real
+            chats - restoring all of them would have filled the sidebar with slices of
+            the same conversations.
+
+            So -All keeps only what looks like a distinct chat, and for each title keeps
+            the newest transcript, which is the one holding the latest state. #>
+
+        Write-Info 'Scanning transcripts for chats with no sidebar entry...'
+        $existingTitles = @{}
+        foreach ($t in $existing.Values) { if ($t) { $existingTitles[[string]$t] = $true } }
+
+        $candidates = @()
+        $skipped = @{ subagent = 0; compact = 0; untitled = 0; tooShort = 0; old = 0; known = 0 }
+
         foreach ($f in [IO.Directory]::GetFiles($projects, '*.jsonl', 'AllDirectories')) {
             $id = [IO.Path]::GetFileNameWithoutExtension($f)
             if ($existing.ContainsKey($id)) { continue }
-            if ((Split-Path (Split-Path $f -Parent) -Leaf) -eq 'subagents') { continue }
-            if ([IO.File]::GetLastWriteTime($f) -lt $cutoff) { continue }
-            $found += $id
+            if ((Split-Path (Split-Path $f -Parent) -Leaf) -eq 'subagents') { $skipped.subagent++; continue }
+            $written = [IO.File]::GetLastWriteTime($f)
+            if ($written -lt $cutoff) { $skipped.old++; continue }
+
+            $info = Get-TranscriptShape $f
+            if ($info.IsContinuation) { $skipped.compact++; continue }
+            if (-not $info.Title) { $skipped.untitled++; continue }
+            if ($info.Turns -lt 3) { $skipped.tooShort++; continue }
+            if ($existingTitles.ContainsKey($info.Title)) { $skipped.known++; continue }
+
+            $candidates += [pscustomobject]@{ Id = $id; Title = $info.Title; Written = $written }
         }
+
+        # one entry per chat: the newest transcript carries the latest state
+        $found = @()
+        foreach ($g in ($candidates | Group-Object Title)) {
+            $found += (@($g.Group | Sort-Object Written -Descending))[0].Id
+        }
+
+        Write-Plain ("    skipped: {0} subagent, {1} compaction continuation(s), {2} untitled, {3} too short, {4} already in the sidebar" -f `
+                $skipped.subagent, $skipped.compact, $skipped.untitled, $skipped.tooShort, $skipped.known)
+        $dupes = $candidates.Count - $found.Count
+        if ($dupes -gt 0) { Write-Plain "    collapsed $dupes older slice(s) of the same chats" }
+
         $SessionIds = $found
-        Write-Info "Found $($SessionIds.Count) session(s) to rebuild."
+        Write-Info "Found $($SessionIds.Count) chat(s) to rebuild."
         if ($SessionIds.Count -eq 0) { return }
     }
 
